@@ -15,7 +15,7 @@ from functools import partial
 from typing import Optional, Callable, Any
 from collections import OrderedDict
 from utils.utils import *
-from utils.modules import Mlp
+from utils.modules import Mlp, CAB
 
 
 class SS2D(nn.Module):
@@ -533,13 +533,24 @@ class CrossFusionBlock(nn.Module):
         self.modals = modals
         d_model_rate = self.modals
         
-        self.norm = nn.ModuleList()
-        self.op = nn.ModuleList()
-        self.FFN = nn.ModuleList()
         self.norm1 = nn.ModuleList()
+        self.FFN = nn.ModuleList()
+        self.norm2 = nn.ModuleList()
+        self.op = nn.ModuleList()
+        self.norm3 = nn.ModuleList()
+        self.conv_blk = nn.ModuleList()
 
         for _ in range(self.modals):
-            self.norm.append(norm_layer(hidden_dim))
+            self.norm1.append(norm_layer(hidden_dim))            
+            self.FFN.append(
+                nn.Sequential(
+                    Permute(0, 3, 1, 2),
+                    Mlp(in_features=hidden_dim, out_fratures=hidden_dim, ffn_expansion_factor=4),
+                    Permute(0, 2, 3, 1),
+                )
+            )
+
+            self.norm2.append(norm_layer(hidden_dim))
             self.op.append(
                 SS2D(
                     d_model=hidden_dim,
@@ -553,22 +564,23 @@ class CrossFusionBlock(nn.Module):
                     **kwargs,
                 )
             )
-            self.norm1.append(norm_layer(hidden_dim*2))
-            self.FFN.append(
+
+            self.norm3.append(norm_layer(hidden_dim*2))
+            self.conv_blk.append(
                 nn.Sequential(
                     Permute(0, 3, 1, 2),
-                    Mlp(in_features=hidden_dim * 2, out_fratures=hidden_dim * 2, ffn_expansion_factor=4),
+                    CAB(hidden_dim * 2),
                     Permute(0, 2, 3, 1),
-                )
+                )    
             )
 
-        self.norm_share = norm_layer(hidden_dim * d_model_rate)            
-        self.proj = nn.Sequential(
-            nn.Linear(hidden_dim * d_model_rate, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
+        self.norm = norm_layer(hidden_dim * d_model_rate)  
+        self.mlp = nn.Sequential(
+            Permute(0, 3, 1, 2),
+            Mlp(in_features=hidden_dim * 2, out_fratures=hidden_dim * 2, ffn_expansion_factor=4),
+            Permute(0, 2, 3, 1),
         )
-        
+        self.norm_share = norm_layer(hidden_dim * d_model_rate)            
         self.op_share = SS2D(
             d_model=hidden_dim,
             d_model_rate=d_model_rate,
@@ -580,6 +592,13 @@ class CrossFusionBlock(nn.Module):
             softmax_version=softmax_version,
             **kwargs,
         )
+        self.linear = nn.Linear(hidden_dim * d_model_rate, hidden_dim * d_model_rate)
+        self.proj = nn.Sequential(
+            nn.Linear(hidden_dim * d_model_rate, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        
         self.conv1 = nn.Sequential(
             Permute(0, 3, 1, 2),
             nn.AdaptiveAvgPool2d(1),
@@ -620,30 +639,28 @@ class CrossFusionBlock(nn.Module):
     def forward(self, x1, x2):
         x1 = x1.permute(0, 2, 3, 1)
         x2 = x2.permute(0, 2, 3, 1)
-        # print("x1:", x1.shape)
+
         x = torch.cat([x1, x2], dim=-1)
-        x_short = x
+        x = self.mlp(self.norm(x))
         x = self.op_share(self.norm_share(x))
 
-        # x1_short = x1
-        # x2_short = x2
+        x1_short = x1
+        x2_short = x2
 
-        g = F.sigmoid(x)
-        x1 = self.norm[0](x1)
-        x1 = self.op[0](x1)
-        x1 = x1 + self.FFN[0](self.norm1[0](x1))
+        g = self.linear(x) # F.sigmoid(x)
+        x1 = self.FFN[0](self.norm1[0](x1))
+        x1 = self.op[0](self.norm2[0](x1))
+        x1 = self.conv_blk[0](self.norm3[0](x1))
 
-        x2 = self.norm[1](x2)
-        x2 = self.op[1](x2)
-        x2 = x2 + self.FFN[1](self.norm1[1](x2))
+        x2 = self.FFN[1](self.norm1[1](x2))
+        x2 = self.op[1](self.norm2[1](x2))
+        x2 = self.conv_blk[1](self.norm3[1](x2))
 
-        x = g * x1 + (1 - g) * x2
-        x = self.proj(x)
-        residual = self.conv2(self.conv1(x_short) * x_short)
+        x = g * x1 + g * x2
+        x = self.proj(x) + x1_short + x2_short
+        # residual = self.conv2(self.conv1(x_short) * x_short)
 
-        x = self.norm_layer(x + residual)
-        x = self.dwconv(x)
-
+        x = self.dwconv(self.norm_layer(x))
         return x
 
 if __name__ == "__main__":

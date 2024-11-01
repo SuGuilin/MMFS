@@ -106,10 +106,10 @@ class TrainPre(object):
         # print("modal_x:", modal_x.shape) 
         # 不需要随机裁剪就取消了
         # Randomly scale and then crop to a fixed size
-        if self.config.train_scale_array is not None:
-            rgb, modal_x, label, guide, scale = random_scale(
-                rgb, modal_x, label, guide, self.config.train_scale_array
-            )
+        # if self.config.train_scale_array is not None:
+        #     rgb, modal_x, label, guide, scale = random_scale(
+        #         rgb, modal_x, label, guide, self.config.train_scale_array
+        #     )
         # rgb = normalize(rgb, self.norm_mean, self.norm_std)
         # modal_x = normalize(modal_x, self.norm_mean, self.norm_std)
 

@@ -761,7 +761,7 @@ class ResBlock(nn.Module):
 
 
 class Fusion_Embed(nn.Module):
-    def __init__(self, embed_dim=[48, 96, 192, 384], bias=False, heads=8):
+    def __init__(self, embed_dim=[48, 96, 192, 384], bias=False, heads=8, norm_layer=nn.LayerNorm,):
         super(Fusion_Embed, self).__init__()
         self.num_heads = heads
         self.embed_dim = embed_dim
@@ -837,24 +837,24 @@ class Fusion_Embed(nn.Module):
         self.fused = nn.ModuleList()
         self.fusion_proj = nn.ModuleList()
         for i in range(len(embed_dim)):
-            self.fused.append(nn.Conv2d(embed_dim[i] * 2, embed_dim[i], kernel_size=3, padding=1, stride=1, bias=bias))
+            # self.fused.append(nn.Conv2d(embed_dim[i] * 2, embed_dim[i], kernel_size=3, padding=1, stride=1, bias=bias))
             # self.fused.append(ResBlock(in_channels=embed_dim[i] * 2, out_channels=embed_dim[i]))
             
-            # self.fused.append(
-            #     CrossFusionBlock(
-            #         modals=2,
-            #         hidden_dim=embed_dim[i],
-            #         drop_path=0.1,
-            #         shared_ssm=False,
-            #         d_state=16,
-            #         ssm_ratio=2.0,
-            #         dt_rank="auto",
-            #         mlp_ratio=4,
-            #         norm_layer=nn.LayerNorm,
-            #     )
-            # )
+            self.fused.append(
+                CrossFusionBlock(
+                    modals=2,
+                    hidden_dim=embed_dim[i],
+                    drop_path=0.1,
+                    shared_ssm=False,
+                    d_state=16,
+                    ssm_ratio=2.0,
+                    dt_rank="auto",
+                    mlp_ratio=4,
+                    norm_layer=norm_layer,
+                )
+            )
 
-            # self.fusion_proj.append(ResBlock(in_channels=embed_dim[i], out_channels=embed_dim[i]))
+            self.fusion_proj.append(ResBlock(in_channels=embed_dim[i], out_channels=embed_dim[i]))
             '''
             self.fuse.append(CIM(dim=embed_dim[i]))
             # self.cross_attention.append(LinearCrossAttention(embed_dim[i], embed_dim[i]))
@@ -999,9 +999,9 @@ class Fusion_Embed(nn.Module):
             out2 = self.sp_B[j](x2)
             x = self.output[j](torch.cat([out1, out2, x], dim=1))
             '''
-            x = self.fused[j](torch.cat([x1, x2], dim=1))
-            # x = self.fused[j](x1, x2)
-            # x = self.fusion_proj[j](x)
+            # x = self.fused[j](torch.cat([x1, x2], dim=1))
+            x = self.fused[j](x1, x2)
+            x = self.fusion_proj[j](x)
             # x = self.fuse[j](x1, x2)
             # x = self.attention[j](x)
             fusion_outs.append(x)

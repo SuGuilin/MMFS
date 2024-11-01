@@ -1,12 +1,12 @@
 import sys
 
-sys.path.append("/home/suguilin/Graduation/myfusion/")
+sys.path.append("/home/suguilin/MMFS/")
 from torch import nn
 import torch
 from collections import OrderedDict
 import math
 from timm.models.layers import trunc_normal_
-
+from mamba_ssm.modules.mamba_simple import Mamba
 from utils.utils import *
 from utils.modules import VSSBlock
 from encoder.cross_mamba import Fusion_Embed
@@ -196,10 +196,40 @@ class CAB(nn.Module):
         x = self.cab(x)
         return x
 
+class TokenSwapMamba(nn.Module):
+    def __init__(self, dim, init_ratio=0.5):
+        super(TokenSwapMamba, self).__init__()
+        self.encoder_x1 = Mamba(dim, bimamba_type=None)
+        self.encoder_x2 = Mamba(dim, bimamba_type=None)
+        self.norm1 = LayerNorm(dim, 'with_bias')
+        self.norm2 = LayerNorm(dim, 'with_bias')
+        self.ratio = nn.Parameter(torch.tensor(init_ratio))
+    def forward(self, x):
+        x1, x2 = x
+        x1_short = x1
+        x2_short = x2
+        x1 = self.norm1(x1)
+        x2 = self.norm2(x2)
+        B, N, C = x1.shape
+        ratio = torch.sigmoid(self.ratio)
+        num_chans = int(C * ratio)
+        exchange_indices = torch.arange(num_chans)
+        retain_indices = torch.arange(num_chans, C)
+
+        x1 = torch.cat([x2[:, :, exchange_indices], x1[:, :, retain_indices]], dim=2)
+        x2 = torch.cat([x1[:, :, exchange_indices], x2[:, :, retain_indices]], dim=2)
+        x1 = self.encoder_x1(x1) + x1_short
+        x2 = self.encoder_x2(x2) + x2_short
+        x = [x1, x2]
+        return x
 
 class CIM(nn.Module):
     def __init__(self, dim, compress_ratio=3, squeeze_factor=16, kernel_size=1, reduction=4):
         super(CIM, self).__init__()
+        self.channel_swap = nn.Sequential(
+            TokenSwapMamba(dim=dim),
+            TokenSwapMamba(dim=dim),
+        )
         self.cab1 = CAB(num_feat=dim, compress_ratio=compress_ratio, squeeze_factor=squeeze_factor)
         self.cab2 = CAB(num_feat=dim, compress_ratio=compress_ratio, squeeze_factor=squeeze_factor)
         self.sab = SAB(kernel_size=kernel_size, reduction=reduction)
@@ -230,6 +260,7 @@ class CIM(nn.Module):
 
         x1_flat = x1.flatten(2).transpose(1, 2)  ##B H*W C
         x2_flat = x2.flatten(2).transpose(1, 2)  ##B H*W C
+        x1_flat, x2_flat = self.channel_swap([x1_flat, x2_flat])
         gated_weight = self.gate(torch.cat((x1_flat, x2_flat), dim=2))  ##B H*W C
         gated_weight = gated_weight.reshape(B, H, W, C).permute(0, 3, 1, 2).contiguous()  ## B C H W
 
