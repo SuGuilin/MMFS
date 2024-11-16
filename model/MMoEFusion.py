@@ -1,9 +1,11 @@
 import sys
+import os
 
-sys.path.append("/home/suguilin/Graduation/myfusion/")
+sys.path.append("/home/suguilin/MMFS/")
+sys.path.append("/home/suguilin/VMamba/")
 import torch
 import torch.nn as nn
-from encoder.dense_mamba import DenseMamba
+from encoder.dense_mamba import DenseMamba, DenseMambaBlock
 from encoder.auxiliary_net import AuxiliaryNet
 from encoder.mixmap_net import CombineNet
 from encoder.Mixture_Experts import MoLE, MoGE, MambaMoE
@@ -11,12 +13,14 @@ from encoder.degradetion import DegradationModel
 from encoder.textencoder import TextEncoder
 from encoder.cross_mamba import CrossMamba, Fusion_Embed, resize, CrossAttention
 from encoder.cross_module import CrossBlock
+from encoder.cross_fusion import Chanel_Cross_Attention
 from decoder.seghead import DecoderHead
-from utils.utils import Final_UpsampleExpand, FinalUpsample_X4, Permute, Upsample_X4
+from utils.utils import Final_UpsampleExpand, FinalUpsample_X4, Permute, Upsample_X4, LayerNorm
 from utils.modules import Restormer_CNN_block
 from utils.NAFBlock import NAFBlock
 from utils.MixBlock import MixBlock
 from memory_profiler import profile
+from classification.models.vmamba import Backbone_VSSM
 
 
 class MMoEFusion(nn.Module):
@@ -42,22 +46,43 @@ class MMoEFusion(nn.Module):
     ):
         super(MMoEFusion, self).__init__()
         # self.degradation = DegradationModel()
-        self.backbone = DenseMamba(
-            in_chans=in_chans,
-            d_state=d_state,
-            patch_size=patch_size,
-            depths=depths,
-            dim=dims[-1],
-            norm_layer=norm_layer,
-            drop_rate=drop_rate,
-            drop_path_rate=drop_path_rate,
-            num_experts=num_experts,
+        # self.backbone = DenseMamba(
+        #     in_chans=in_chans,
+        #     d_state=d_state,
+        #     patch_size=patch_size,
+        #     depths=depths,
+        #     dim=dims[-1],
+        #     norm_layer=norm_layer,
+        #     drop_rate=drop_rate,
+        #     drop_path_rate=drop_path_rate,
+        #     num_experts=num_experts,
+        # )
+        channel_first = True
+        self.backbone = Backbone_VSSM(
+            pretrained='/home/suguilin/MMFS/pretrained/classification/vssm1_tiny_0230s_ckpt_epoch_264.pth',
+            # pretrained=None,
+            depths=[2, 2, 8, 2], dims=96, drop_path_rate=0.2, 
+            patch_size=4, in_chans=3, num_classes=1000, 
+            ssm_d_state=1, ssm_ratio=1.0, ssm_dt_rank="auto", ssm_act_layer="silu",
+            ssm_conv=3, ssm_conv_bias=False, ssm_drop_rate=0.0, 
+            ssm_init="v0", forward_type="v05_noz", 
+            mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
+            patch_norm=True, norm_layer=("ln2d" if channel_first else "ln"), 
+            downsample_version="v3", patchembed_version="v2", 
+            use_checkpoint=False, posembed=False, imgsize=224, 
         )
         # 直接读入文本编码npy了
         # self.textencoder = TextEncoder(device=device) 
         # self.cross_mamba_rgb = CrossMamba()
         # self.cross_mamba_ir = CrossMamba()
-        self.fusion_embed = Fusion_Embed(embed_dim=channels)
+        self.fusion_embed = Fusion_Embed(embed_dim=channels, norm_layer=norm_layer)
+        self.dim_match = nn.Conv2d(in_channels=embed_dim, out_channels=dims[-1], kernel_size=1)
+        self.seg_fus = Chanel_Cross_Attention(dim=dims[-1], num_head=8, bias=True)
+        self.dm_fusion = nn.Sequential(
+            Permute(0, 2, 3, 1),
+            DenseMambaBlock(dims=dims[-1]),
+            Permute(0, 3, 1, 2),
+        )
         # self.expand = nn.Sequential(
         #     nn.ConvTranspose2d(in_channels=dims[-1]*2, out_channels=dims[-1]*2, kernel_size=4, stride=2, padding=1),
         #     nn.ReLU(),
@@ -97,14 +122,15 @@ class MMoEFusion(nn.Module):
         self.final_up = Upsample_X4(dims[-1], out_chans)
         # self.decoder = nn.Conv2d(dims[-1] // 4, out_chans, 3, 1, 1)
 
-        # self.decoder = nn.Sequential(
-        #     Permute(0, 3, 1, 2),
-        #     nn.Conv2d(dims[-1], dims[-1] // 2, 1),
-        #     nn.LeakyReLU(negative_slope=0.2, inplace=True),
-        #     nn.Conv2d(dims[-1] // 2, dims[-1] // 4, 3, 1, 1),
-        #     nn.LeakyReLU(negative_slope=0.2, inplace=True),
-        #     nn.Conv2d(dims[-1] // 4, out_chans, 1),
-        # )
+        self.decoder = nn.Sequential(
+            nn.Conv2d(3 * 3, dims[-1], 1),
+            # nn.Conv2d(dims[-1] * 3, dims[-1] // 2, 1),
+            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            # nn.Conv2d(dims[-1] // 2, dims[-1] // 4, 3, 1, 1),
+            # nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            # nn.Conv2d(dims[-1] // 4, out_chans, 1),
+            nn.Conv2d(dims[-1], 3, kernel_size=1)
+        )
 
         # helper methods needed for reconstruction as follows:
 
@@ -132,7 +158,10 @@ class MMoEFusion(nn.Module):
         # ir = self.degradation(ir)
         # deg_ir = ir
         # print("after:", rgb.shape, ir.shape)
-        outs_rgb, outs_ir, branch_rgb, branch_ir, loss_aux = self.backbone(rgb, ir)
+        # outs_rgb, outs_ir, branch_rgb, branch_ir, loss_aux = self.backbone(rgb, ir)
+        loss_aux = 0
+        outs_rgb = self.backbone(rgb)
+        outs_ir = self.backbone(ir)
         B, C, H, W = outs_rgb[0].shape
         # print("dense:", rgb_dense.shape, ir_dense.shape)
         # _, _, bert_rgb = self.textencoder(text_rgb)
@@ -225,18 +254,23 @@ class MMoEFusion(nn.Module):
         # print(y_global.shape)
         # fused = self.final_up(y_global.permute(0, 2, 3, 1).contiguous())
         seg_out = self.seghead(semanfea_fusion)
+        fused = semanfea_fusion[0]
+        # fused = self.seg_fus(self.dim_match(_c), fused)
+        # fused = self.dm_fusion(fused)
+
         seg_out = resize(input=seg_out, size=input_size[2:], mode='bilinear', align_corners=self.align_corners)
         # print(seg_out)
         # print("max_seg:", torch.max(seg_out))
         # print("min_seg:", torch.min(seg_out))
         # print(seg_out.shape)
         # fused = self.conv_after_body(torch.cat([y_global, y_local], dim=1)) + semanfea_fusion[0]
-        fused = semanfea_fusion[0]
+        
         # supplement = self.expand(semanfea_fusion[1])
         # fused = fused + supplement
         # fused = torch.cat([fused, supplement], dim=1)
         # fused = self.final_up(torch.cat([y_global, y_local], dim=1))
         fused = self.final_up(self.conv_before_upsample(fused))
+        fused = self.decoder(torch.cat([fused, rgb, ir], dim=1))
         # print(fused.shape)
         # res = self.decoder(fused)
         return fused, seg_out, loss_aux#, deg_rgb, deg_ir #res#, load_loss
