@@ -56,7 +56,8 @@ def generate_random_crop_pos(ori_size, crop_size):
 
     return pos_h, pos_w
 
-def pad_image_to_shape(img, shape, border_mode, value):
+def pad_image_to_shape(img, shape, border_mode, value):  # Enter the interface
+    # shape: [480, 640]  border_mode: 0  value: 0
     margin = np.zeros(4, np.uint32)
     shape = get_2dshape(shape)
     pad_height = shape[0] - img.shape[0] if shape[0] - img.shape[0] > 0 else 0
@@ -176,9 +177,9 @@ def random_crop(img, gt, size):
 
     return img, gt
 
-def normalize(img, mean, std):
+def normalize(img):#, mean, std):
     # pytorch pretrained model need the input range: 0-1
     img = img.astype(np.float64) / 255.0
-    img = img - mean
-    img = img / std
+    # img = img - mean
+    # img = img / std
     return img

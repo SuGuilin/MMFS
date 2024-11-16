@@ -403,63 +403,56 @@ class Mlp_(nn.Module):
         x = self.drop(x)
         return x
 
+
 class ElementScale(nn.Module):
     """A learnable element-wise scaler."""
-    def __init__(self, embed_dims, init_value=0., requires_grad=True):
+
+    def __init__(self, embed_dims, init_value=0.0, requires_grad=True):
         super(ElementScale, self).__init__()
         self.scale = nn.Parameter(
-            init_value * torch.ones((1, embed_dims, 1, 1)),
-            requires_grad=requires_grad
+            init_value * torch.ones((1, embed_dims, 1, 1)), requires_grad=requires_grad
         )
 
     def forward(self, x):
         return x * self.scale
-    
-class ChannelAggregationFFN(nn.Module):
-    """An implementation of FFN with Channel Aggregation.
-    """
 
-    def __init__(self,
-                 embed_dims,
-                 ffn_dims,
-                 kernel_size=3,
-                 act=nn.GELU(),
-                 ffn_drop=0.):
+
+class ChannelAggregationFFN(nn.Module):
+    """An implementation of FFN with Channel Aggregation."""
+
+    def __init__(
+        self, embed_dims, ffn_dims, kernel_size=3, act=nn.GELU(), ffn_drop=0.0
+    ):
         super(ChannelAggregationFFN, self).__init__()
 
         self.embed_dims = embed_dims
         self.ffn_dims = ffn_dims
 
         self.fc1 = nn.Conv2d(
-            in_channels=embed_dims,
-            out_channels=self.ffn_dims,
-            kernel_size=1
+            in_channels=embed_dims, out_channels=self.ffn_dims, kernel_size=1
         )
-        
+
         self.dwconv = nn.Conv2d(
             in_channels=self.ffn_dims,
             out_channels=self.ffn_dims,
             kernel_size=kernel_size,
             padding=kernel_size // 2,
-            groups=self.ffn_dims
+            groups=self.ffn_dims,
         )
-        
+
         self.act = act
         self.fc2 = nn.Conv2d(
-            in_channels=self.ffn_dims,
-            out_channels=embed_dims,
-            kernel_size=1
+            in_channels=self.ffn_dims, out_channels=embed_dims, kernel_size=1
         )
 
         self.drop = nn.Dropout(ffn_drop)
 
         self.decompose = nn.Conv2d(
             in_channels=self.ffn_dims,  # C -> 1
-            out_channels=1, kernel_size=1,
+            out_channels=1,
+            kernel_size=1,
         )
-        self.sigma = ElementScale(
-            self.ffn_dims, init_value=1e-5, requires_grad=True
-        )
+        self.sigma = ElementScale(self.ffn_dims, init_value=1e-5, requires_grad=True)
         self.decompose_act = act
 
     def feat_decompose(self, x):
@@ -479,15 +472,25 @@ class ChannelAggregationFFN(nn.Module):
         x = self.drop(x)
         return x
 
+
 class MultiOrderGatedAggregation(nn.Module):
-    """Multi-order Features with Dilated DWConv Kernel.
-    """
-    def __init__(self,
-                 embed_dims,
-                 dw_dilation=[1, 2, 3,],
-                 channel_split=[1, 3, 4,],
-                 act=nn.SiLU(),
-                ):
+    """Multi-order Features with Dilated DWConv Kernel."""
+
+    def __init__(
+        self,
+        embed_dims,
+        dw_dilation=[
+            1,
+            2,
+            3,
+        ],
+        channel_split=[
+            1,
+            3,
+            4,
+        ],
+        act=nn.SiLU(),
+    ):
         super(MultiOrderGatedAggregation, self).__init__()
 
         self.split_ratio = [i / sum(channel_split) for i in channel_split]
@@ -499,7 +502,9 @@ class MultiOrderGatedAggregation(nn.Module):
         assert 1 <= min(dw_dilation) and max(dw_dilation) <= 3
         assert embed_dims % sum(channel_split) == 0
 
-        self.gate = nn.Conv2d(in_channels=embed_dims, out_channels=embed_dims, kernel_size=1)
+        self.gate = nn.Conv2d(
+            in_channels=embed_dims, out_channels=embed_dims, kernel_size=1
+        )
 
         # basic DW conv
         self.DW_conv0 = nn.Conv2d(
@@ -508,7 +513,7 @@ class MultiOrderGatedAggregation(nn.Module):
             kernel_size=5,
             padding=(1 + 4 * dw_dilation[0]) // 2,
             groups=self.embed_dims,
-            stride=1, 
+            stride=1,
             dilation=dw_dilation[0],
         )
         # DW conv 1
@@ -518,7 +523,7 @@ class MultiOrderGatedAggregation(nn.Module):
             kernel_size=5,
             padding=(1 + 4 * dw_dilation[1]) // 2,
             groups=self.embed_dims_1,
-            stride=1, 
+            stride=1,
             dilation=dw_dilation[1],
         )
         # DW conv 2
@@ -528,27 +533,31 @@ class MultiOrderGatedAggregation(nn.Module):
             kernel_size=7,
             padding=(1 + 6 * dw_dilation[2]) // 2,
             groups=self.embed_dims_2,
-            stride=1, 
+            stride=1,
             dilation=dw_dilation[2],
         )
         # a channel convolution
         self.PW_conv = nn.Conv2d(  # point-wise convolution
-            in_channels=embed_dims,
-            out_channels=embed_dims,
-            kernel_size=1)
-        
-        self.proj = nn.Conv2d(in_channels=embed_dims, out_channels=embed_dims, kernel_size=1)
+            in_channels=embed_dims, out_channels=embed_dims, kernel_size=1
+        )
+
+        self.proj = nn.Conv2d(
+            in_channels=embed_dims, out_channels=embed_dims, kernel_size=1
+        )
         self.act_gate = act
 
     def forward(self, x):
         g = self.gate(x)
         x_0 = self.DW_conv0(x)
-        x_1 = self.DW_conv1(x_0[:, self.embed_dims_0: self.embed_dims_0+self.embed_dims_1, ...])
-        x_2 = self.DW_conv2(x_0[:, self.embed_dims-self.embed_dims_2:, ...])
-        x = torch.cat([x_0[:, :self.embed_dims_0, ...], x_1, x_2], dim=1)
+        x_1 = self.DW_conv1(
+            x_0[:, self.embed_dims_0 : self.embed_dims_0 + self.embed_dims_1, ...]
+        )
+        x_2 = self.DW_conv2(x_0[:, self.embed_dims - self.embed_dims_2 :, ...])
+        x = torch.cat([x_0[:, : self.embed_dims_0, ...], x_1, x_2], dim=1)
         v = self.PW_conv(x)
         x = self.proj(self.act_gate(g) * self.act_gate(v))
         return x
+
 
 class MultiScaleDWConv(nn.Module):
     def __init__(self, dim, scale=(1, 3, 5, 7)):
@@ -561,14 +570,16 @@ class MultiScaleDWConv(nn.Module):
                 channels = dim - dim // len(scale) * (len(scale) - 1)
             else:
                 channels = dim // len(scale)
-            conv = nn.Conv2d(channels, 
-                             channels,
-                             kernel_size=scale[i],
-                             padding=scale[i]//2,
-                             groups=channels)
+            conv = nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=scale[i],
+                padding=scale[i] // 2,
+                groups=channels,
+            )
             self.channels.append(channels)
             self.proj.append(conv)
-            
+
     def forward(self, x):
         x = torch.split(x, split_size_or_sections=self.channels, dim=1)
         out = []
@@ -579,12 +590,14 @@ class MultiScaleDWConv(nn.Module):
 
 
 class MS_FFN(nn.Module):  ### MS-FFN
-    def __init__(self,
-                 in_features,
-                 hidden_features=None,
-                 out_features=None,
-                 act=nn.GELU(),
-                 drop=0,):
+    def __init__(
+        self,
+        in_features,
+        hidden_features=None,
+        out_features=None,
+        act=nn.GELU(),
+        drop=0,
+    ):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
@@ -607,11 +620,12 @@ class MS_FFN(nn.Module):  ### MS-FFN
 
         x = self.dwconv(x) + x
         x = self.norm(self.act(x))
-        
+
         x = self.drop(x)
         x = self.fc2(x)
         x = self.drop(x)
         return x
+
 
 class ConvGate(nn.Module):
     def __init__(self, dim, num_experts):
@@ -632,17 +646,18 @@ class ConvGate(nn.Module):
         gate_logits = self.gate(torch.cat([feat1, feat2], dim=1).reshape(x.size(0), -1))
         return gate_logits
 
+
 class Router(nn.Module):
     def __init__(self, embed_size, num_out_path):
         super(Router, self).__init__()
         self.num_out_path = num_out_path
         self.avgpool = nn.AdaptiveAvgPool2d(1)
         self.maxpool = nn.AdaptiveMaxPool2d(1)
-        #self.conv_pool = nn.Linear(embed_size*36*36, embed_size)
+        # self.conv_pool = nn.Linear(embed_size*36*36, embed_size)
         self.mlp = nn.Sequential(
-            nn.Linear(embed_size*2, embed_size), 
-            nn.ReLU(True), 
-            nn.Linear(embed_size, num_out_path)
+            nn.Linear(embed_size * 2, embed_size),
+            nn.ReLU(True),
+            nn.Linear(embed_size, num_out_path),
         )
         self.init_weights()
 
@@ -650,7 +665,7 @@ class Router(nn.Module):
         self.mlp[2].bias.data.fill_(1.5)
 
     def forward(self, x):
-        #x = x.reshape(x.shape[0],-1)
+        # x = x.reshape(x.shape[0],-1)
         avg_out = self.avgpool(x)
         max_out = self.maxpool(x)
         f_out = torch.cat([max_out, avg_out], 1)
@@ -660,7 +675,8 @@ class Router(nn.Module):
         soft_g = x
         return soft_g
 
-'''
+
+"""
 class MoeLayer(nn.Module):
     def __init__(
         self,
@@ -718,7 +734,8 @@ class MoeLayer(nn.Module):
         # results_out = results.view(ishape)
         results_out = results.permute(0, 2, 3, 1)
         return results_out, l_aux
-'''
+"""
+
 
 class MoeLayer(nn.Module):
     def __init__(
@@ -745,29 +762,37 @@ class MoeLayer(nn.Module):
         inputs = inputs_raw.permute(0, 3, 1, 2)
         n, c, h, w = inputs.shape
         gate_logits = self.gate(inputs)
-        gates = F.softmax(gate_logits, dim=1)   # (batch_size, num_experts)
+        gates = F.softmax(gate_logits, dim=1)  # (batch_size, num_experts)
         # print(gates)
 
         # Top-2 routing
         weights, selected_experts = torch.topk(gates, self.num_experts_per_tok)
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         # print(weights)
-        
+
         # Rank-k routing
         rank_k_value, rank_k_index = torch.kthvalue(gates, self.kth_experts, dim=1)
 
-        indices1_s = torch.argmax(gates, dim=1)  # get the chosen expert id for every token
+        indices1_s = torch.argmax(
+            gates, dim=1
+        )  # get the chosen expert id for every token
         num_experts = int(gates.shape[1])
-        mask1 = F.one_hot(indices1_s, num_classes=num_experts)  # (batch_size, num_experts)
-        
+        mask1 = F.one_hot(
+            indices1_s, num_classes=num_experts
+        )  # (batch_size, num_experts)
+
         # Compute l_aux
         # entropy = -torch.sum(gates * torch.log(gates + 1e-8), dim=1).mean()
-        me = torch.mean(gates, dim=0)  # (num_experts, ) get the average weight (probability) of each expert being selected in the entire batch
-        ce = torch.mean(mask1.float(), dim=0)  # get the frequency of each expert being selected in the actual selection
+        me = torch.mean(
+            gates, dim=0
+        )  # (num_experts, ) get the average weight (probability) of each expert being selected in the entire batch
+        ce = torch.mean(
+            mask1.float(), dim=0
+        )  # get the frequency of each expert being selected in the actual selection
         # compare the probability distribution of each expert being selected (me) with the actual selection (ce)
         # measures how well each expert's actual usage matches their expected usage
-        l_aux = torch.mean(me * ce) * num_experts * num_experts# + entropy
-        
+        l_aux = torch.mean(me * ce) * num_experts * num_experts  # + entropy
+
         # Compute V_valid subset
         # max_top2 = torch.max(top2_values, dim=1, keepdim=True)[0]
         # v_valid_mask = (top2_values >= torch.log(self.alpha) + max_top2).float()
@@ -778,17 +803,20 @@ class MoeLayer(nn.Module):
                 continue
             else:
                 for b, i in zip(batch_idx, nth_expert):
-                    results_strong[b:b+1] += weights[b:b+1, i:i+1].view(-1, 1, 1) * expert(inputs[b:b+1])
-        
+                    results_strong[b : b + 1] += weights[b : b + 1, i : i + 1].view(
+                        -1, 1, 1
+                    ) * expert(inputs[b : b + 1])
+
         # results_weak = torch.zeros_like(inputs)
         # for b, i in enumerate(rank_k_index):
         #     results_weak[b:b+1] += self.experts[i](inputs[b:b+1])
         results_strong = results_strong.permute(0, 2, 3, 1)
 
         # results_weak = results_weak.permute(0, 2, 3, 1)
-         #
-        results_out = results_strong #(1 + self.beta) * results_strong - self.beta * results_weak
+        #
+        results_out = results_strong  # (1 + self.beta) * results_strong - self.beta * results_weak
         return results_out, l_aux
+
 
 class VSSBlock(nn.Module):
     def __init__(
@@ -803,7 +831,7 @@ class VSSBlock(nn.Module):
         d_state: int = 16,
         **kwargs,
     ):
-        super().__init__()        
+        super().__init__()
         self.num_experts = num_experts
         self.dim = hidden_dim
         self.num_heads = num_heads
@@ -813,7 +841,7 @@ class VSSBlock(nn.Module):
         #     norm_layer(hidden_dim),
         #     Permute(0, 3, 1, 2),
         #     # nn.Conv2d(hidden_dim, hidden_dim, 1),
-        #     nn.Conv2d(hidden_dim, hidden_dim*2, 3, 1, 1, groups=hidden_dim),
+        #     nn.Conv2d(hidden_dim, hidden_dim * 2, 3, 1, 1, groups=hidden_dim),
         #     SimpleGate(),
         #     Permute(0, 2, 3, 1),
         # )
@@ -833,19 +861,21 @@ class VSSBlock(nn.Module):
         #     nn.Linear(hidden_dim * 2, 1),
         #     nn.Sigmoid(),
         # )
-        
-        # 局部分支
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.conv1 = nn.Conv2d(self.dim, self.dim, 1)
-        self.conv2 = nn.Conv2d(self.dim, self.dim, 1)
 
-        # self.local = ChannelAggregationFFN(embed_dims=hidden_dim, ffn_dims=int(hidden_dim*4))            
+        # 局部分支
+        # self.pool = nn.AdaptiveAvgPool2d(1)
+        # self.conv1 = nn.Conv2d(self.dim, self.dim, 1)
+        # self.conv2 = nn.Conv2d(self.dim, self.dim, 1)
+
+        # self.local = ChannelAggregationFFN(embed_dims=hidden_dim, ffn_dims=int(hidden_dim*4))
 
         # 全局分支
         self.norm = norm_layer(hidden_dim)
         self.op = SS2D(d_model=hidden_dim, dropout=drop_rate, d_state=d_state, **kwargs)
         self.drop_path = DropPath(drop_path)
-        self.skip_scale = nn.Parameter(torch.ones((1, 1, 1, hidden_dim)), requires_grad=True)
+        self.skip_scale = nn.Parameter(
+            torch.ones((1, 1, 1, hidden_dim)), requires_grad=True
+        )
 
         # 合并
         # self.proj = nn.Sequential(
@@ -859,40 +889,44 @@ class VSSBlock(nn.Module):
         #     nn.BatchNorm2d(hidden_dim),
         #     )
         # self.gate = ConvGate(hidden_dim, num_experts)
-        self.gate = Router(hidden_dim, num_experts)
+        # self.gate = Router(hidden_dim, num_experts)
 
         # self.conv_blk = CAB(hidden_dim)
+        self.ms_ffn = MS_FFN(in_features=hidden_dim, hidden_features=hidden_dim*2)
         self.norm2 = norm_layer(hidden_dim)
-        self.skip_scale2 = nn.Parameter(torch.ones((1, 1, 1, hidden_dim)), requires_grad=True)
-        self.norm3 = norm_layer(hidden_dim)
+        self.skip_scale2 = nn.Parameter(
+            torch.ones((1, 1, 1, hidden_dim)), requires_grad=True
+        )
+        # self.norm3 = norm_layer(hidden_dim)
         # self.mlp = Mlp_(in_features=hidden_dim, hidden_features=hidden_dim * 4, act_layer=nn.SiLU)
 
-        self.experts = [
-            # LinearAttention(
-            #     dim=self.dim,
-            #     num_heads=self.num_heads,
-            #     qkv_bias=True,
-            # )
-            # MS_FFN(
-            #     in_features=hidden_dim,
-            #     hidden_features=int(hidden_dim*4),
-            #     )
-            Mlp(
-                in_features=hidden_dim,
-                out_fratures=hidden_dim,
-                ffn_expansion_factor=2,
-            )
-            for _ in range(self.num_experts)
-        ]
+        # self.experts = [
+        #     # LinearAttention(
+        #     #     dim=self.dim,
+        #     #     num_heads=self.num_heads,
+        #     #     qkv_bias=True,
+        #     # )
+        #     # MS_FFN(
+        #     #     in_features=hidden_dim,
+        #     #     hidden_features=int(hidden_dim*4),
+        #     #     )
+        #     Mlp(
+        #         in_features=hidden_dim,
+        #         out_fratures=hidden_dim,
+        #         ffn_expansion_factor=2,
+        #     )
+        #     for _ in range(self.num_experts)
+        # ]
 
-        self.moe_layer = MoeLayer(
-            experts=self.experts,
-            gate=self.gate,
-            num_experts=self.num_experts,
-            num_experts_per_tok=self.topk,
-            kth_experts=2,
-            beta=0.5,
-        )
+        # self.moe_layer = MoeLayer(
+        #     experts=self.experts,
+        #     gate=self.gate,
+        #     num_experts=self.num_experts,
+        #     num_experts_per_tok=self.topk,
+        #     kth_experts=2,
+        #     beta=0.5,
+        # )
+
     # 局部分支
     def simpleReplace(self, x):
         return self.conv2(x * self.conv1(self.pool(x)))
@@ -939,28 +973,29 @@ class VSSBlock(nn.Module):
         # x, y = self.lmm(x, y)
         # element-wise sum
         # alpha = self.alpha(torch.cat([x, y.permute(0, 2, 3, 1)], dim=3))
-        # x = alpha * x +  (1 - alpha) * y.permute(0, 2, 3, 1)
+        # x = x +  alpha * y.permute(0, 2, 3, 1)
 
         # residual connection
-        x = input * self.skip_scale + x#.permute(0, 2, 3, 1)
+        x = input * self.skip_scale + x  # .permute(0, 2, 3, 1)
         # x = self.proj(x) + x
-        
+
         # x = input * self.skip_scale + self.drop_path(self.op(x))
-        
+
         # 使用moe，参考BlackMamba: 'Mixture of Experts for State-Space Models'思路，多了辅助损失
         # print("aftet merged:", x.shape)
         # x = x * self.skip_scale2 + self.conv_blk(self.norm2(x).permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3, 1).contiguous()
-        res, l_aux = self.moe_layer(self.norm3(x))
+        x = x * self.skip_scale2 + self.ms_ffn(self.norm2(x).permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3, 1).contiguous()
+        # res, l_aux = self.moe_layer(self.norm3(x))
         # 这点的残差连接也需要检验是否有存在的必要
-        x = x * self.skip_scale2 + res
-        loss_aux += l_aux
+        # x = x * self.skip_scale2 + res
+        # loss_aux += l_aux
         # 尝试moe先注释掉，2024-08-19,22:19
         # x = x * self.skip_scale2 + self.conv_blk(self.norm2(x).permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3, 1).contiguous()
-        
+
         # print(f"After conv_blk - min: {x.min().item()}, max: {x.max().item()}")
         # x = x + self.drop_path(self.mlp(self.norm3(x)))
         # x = input + self.drop_path(self.op(self.norm(input)))
-        return x, loss_aux#l_aux
+        return x, loss_aux  # l_aux
 
 
 #######################################################################################################

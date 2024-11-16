@@ -1,6 +1,6 @@
 import sys
 
-sys.path.append("/home/suguilin/Graduation/myfusion/")
+sys.path.append("/home/suguilin/MMFS/")
 sys.path.append("/home/suguilin/zigma/")
 import math
 import torch

@@ -48,8 +48,8 @@ class TextEncoder(nn.Module):
                     clip_text_embeddings = self.clip_model(**clip_encodings).pooler_output
                 clip_encoded_texts.append(clip_text_embeddings)
         
-        # for text, text_name in zip(text_list, image_list):
-        for text in text_list:
+        for text, text_name in zip(text_list, image_list):
+        # for text in text_list:
             bert_encodings = self.bert_tokenizer(text, return_tensors="pt", padding="max_length", truncation=True, max_length=256)
             input_ids = bert_encodings["input_ids"].to(self.device)
             attention_mask = bert_encodings["attention_mask"].to(self.device)
@@ -59,10 +59,10 @@ class TextEncoder(nn.Module):
             # bert_text_embeddings = bert_outputs.last_hidden_state[:, 0, :]  # Shape: (batch_size, hidden_size)
             bert_text_embeddings = bert_outputs.last_hidden_state #.pooler_output
             # print("bert_last:", bert_text_embeddings.shape)
-            # npy_path = os.path.join('/home/suguilin/myfusion/datasets/MFNet/Text_Bert/RGB', '{}.npy'.format(text_name))
-            # npy_bert = bert_text_embeddings.cpu().numpy()
-            # np.save(npy_path, npy_bert)
-            # print('{} npy has saved!!!'.format(text_name))
+            npy_path = os.path.join('/home/suguilin/MMFS/datasets/FMB/Text_Bert/Infrared', '{}.npy'.format(text_name))
+            npy_bert = bert_text_embeddings.cpu().numpy()
+            np.save(npy_path, npy_bert)
+            print('{} npy has saved!!!'.format(text_name))
             bert_encoded_texts.append(bert_text_embeddings.squeeze())
         bert_encoded_texts = torch.stack(bert_encoded_texts)
         # print(bert_encoded_texts)
@@ -81,7 +81,7 @@ if __name__ == "__main__":
         ]
     text_names = []
     text_contents = []
-    dir = '/home/suguilin/myfusion/datasets/MFNet/Text/RGB'
+    dir = '/home/suguilin/MMFS/datasets/FMB/Text/Infrared'
 
     # there are 1444 files in total
     for filename in os.listdir(dir):

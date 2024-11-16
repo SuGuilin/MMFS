@@ -143,7 +143,7 @@ class Engine(object):
         self.inject_default_parser()
         self.args = self.parser.parse_args()
 
-        self.config = self.load_config(config_path)
+        # self.config = self.load_config(config_path)
         self.continue_state_object = self.args.continue_fpath
 
         if "WORLD_SIZE" in os.environ:

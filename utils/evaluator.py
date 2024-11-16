@@ -323,12 +323,16 @@ class Evaluator(object):
         self.ndata = self.dataset.get_length()
         self.network = network
         self.devices = devices
+        self.eval_crop_size = config.eval_crop_size
+        self.eval_stride_rate = config.eval_stride_rate
+        self.class_num = config.num_classes
+        self.multi_scales = config.eval_scale_array
+        self.is_flip = config.eval_flip
 
         self.context = mp.get_context('spawn')
         self.val_func = None
         self.save_label = False
         self.results_queue = self.context.Queue(self.ndata)
-        self.class_num = config.num_classes
         self.verbose = verbose
         self.save_path = save_path
         if save_path is not None:
@@ -411,7 +415,6 @@ class Evaluator(object):
             # vi = (item['data'] * 255).astype(np.uint8)  # 一通道rgb的
             # ir = (item['modal_x'] * 255).astype(np.uint8)
             ir = (item['modal_x'] * 255).transpose(2, 0, 1)[0, :, :].astype(np.uint8)
-
             vi = cv2.cvtColor((item['data'] * 255).transpose(1, 2, 0), cv2.COLOR_BGR2GRAY)
 
             results_dict = self.func_per_iteration(item, self.devices[0], self.config)
@@ -488,6 +491,7 @@ class Evaluator(object):
         label = item['label']
         name = item['fn']
 
+        # pred = self.sliding_eval_rgbX(img_rgb.transpose(1, 2, 0), img_ir, self.eval_crop_size, self.eval_stride_rate, device)
         # 这点重建的时候注释掉了 2024-9-29 23:44修改
         # img_ir = np.expand_dims(img_ir, axis=2)
         # img_rgb = np.expand_dims(img_rgb, axis=2)
@@ -544,14 +548,15 @@ class Evaluator(object):
             # fusion_img = np.transpose(fusion_img, (1, 2, 0))
             # Image.fromarray(fusion_img).save(os.path.join(self.save_path, fn))
             cv2.imwrite(os.path.join(self.save_path, fn_fus), fusion_img)
-            class_colors, color_map = self.get_class_colors()
+            # class_colors, color_map = self.get_class_colors()
+            class_colors = config.pattale
             segment_img = np.zeros((pred.shape[0], pred.shape[1], 3), dtype=np.uint8)
             label_img = np.zeros((label.shape[0], label.shape[1], 3), dtype=np.uint8)
             for i in range(config.num_classes):
                 segment_img[pred == i] = class_colors[i]
-                # label_img[label == i] = class_colors[i]
-            for cls_id, cls_color in color_map.items():
-                label_img[label == cls_id] = cls_color
+                label_img[label == i] = class_colors[i]
+            # for cls_id, cls_color in color_map.items():
+            #     label_img[label == cls_id] = cls_color
         
             # fusion_img = cv2.cvtColor(fusion_img, cv2.COLOR_GRAY2BGR)
             
@@ -666,3 +671,129 @@ class Evaluator(object):
             dd = self.dataset[idx]
             results_dict = self.func_per_iteration(dd, device, self.config)
             self.results_queue.put(results_dict)
+
+
+    def sliding_eval_rgbX(self, img, modal_x, crop_size, stride_rate, device=None):
+        crop_size = to_2tuple(crop_size)
+        ori_rows, ori_cols, _ = img.shape
+        processed_pred = np.zeros((ori_rows, ori_cols, self.class_num))
+
+        for s in self.multi_scales:
+            img_scale = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
+            if len(modal_x.shape) == 2:
+                modal_x_scale = cv2.resize(modal_x, None, fx=s, fy=s, interpolation=cv2.INTER_NEAREST)
+            else:
+                modal_x_scale = cv2.resize(modal_x, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
+
+            new_rows, new_cols, _ = img_scale.shape
+            processed_pred += self.scale_process_rgbX(img_scale, modal_x_scale, (ori_rows, ori_cols), crop_size, stride_rate, device)
+        
+        pred = processed_pred.argmax(2)
+        return pred
+
+
+    def scale_process_rgbX(self, img, modal_x, ori_shape, crop_size, stride_rate, device=None):
+        new_rows, new_cols, c = img.shape
+        long_size = new_cols if new_cols > new_rows else new_rows
+
+        if new_cols <= crop_size[1] or new_rows <= crop_size[0]:
+            input_data, input_modal_x, margin = self.process_image_rgbX(img, modal_x, crop_size)
+            score = self.val_func_process_rgbX(input_data, input_modal_x, device) 
+            score = score[:, margin[0]:(score.shape[1] - margin[1]), margin[2]:(score.shape[2] - margin[3])]
+        else:
+            stride = (int(np.ceil(crop_size[0] * stride_rate)), int(np.ceil(crop_size[1] * stride_rate)))
+            img_pad, margin = pad_image_to_shape(img, crop_size, cv2.BORDER_CONSTANT, value=0)
+            modal_x_pad, margin = pad_image_to_shape(modal_x, crop_size, cv2.BORDER_CONSTANT, value=0)
+
+            pad_rows = img_pad.shape[0]
+            pad_cols = img_pad.shape[1]
+            r_grid = int(np.ceil((pad_rows - crop_size[0]) / stride[0])) + 1
+            c_grid = int(np.ceil((pad_cols - crop_size[1]) / stride[1])) + 1
+            data_scale = torch.zeros(self.class_num, pad_rows, pad_cols).cuda(device)
+
+            for grid_yidx in range(r_grid):
+                for grid_xidx in range(c_grid):
+                    s_x = grid_xidx * stride[0]
+                    s_y = grid_yidx * stride[1]
+                    e_x = min(s_x + crop_size[0], pad_cols)
+                    e_y = min(s_y + crop_size[1], pad_rows)
+                    s_x = e_x - crop_size[0]
+                    s_y = e_y - crop_size[1]
+                    img_sub = img_pad[s_y:e_y, s_x: e_x, :]
+                    if len(modal_x_pad.shape) == 2:
+                        modal_x_sub = modal_x_pad[s_y:e_y, s_x: e_x]
+                    else:
+                        modal_x_sub = modal_x_pad[s_y:e_y, s_x: e_x,:]
+
+                    input_data, input_modal_x, tmargin = self.process_image_rgbX(img_sub, modal_x_sub, crop_size)
+                    temp_score = self.val_func_process_rgbX(input_data, input_modal_x, device)
+                    
+                    temp_score = temp_score[:, tmargin[0]:(temp_score.shape[1] - tmargin[1]),
+                                            tmargin[2]:(temp_score.shape[2] - tmargin[3])]
+                    data_scale[:, s_y: e_y, s_x: e_x] += temp_score
+            score = data_scale
+            score = score[:, margin[0]:(score.shape[1] - margin[1]),
+                    margin[2]:(score.shape[2] - margin[3])]
+
+        score = score.permute(1, 2, 0)
+        data_output = cv2.resize(score.cpu().numpy(), (ori_shape[1], ori_shape[0]), interpolation=cv2.INTER_LINEAR)
+
+        return data_output
+    
+    def val_func_process_rgbX(self, input_data, input_modal_x, device=None):
+        input_data = np.ascontiguousarray(input_data[None, :, :, :], dtype=np.float32)
+        input_data = torch.FloatTensor(input_data).cuda(device)
+    
+        input_modal_x = np.ascontiguousarray(input_modal_x[None, :, :, :], dtype=np.float32)
+        input_modal_x = torch.FloatTensor(input_modal_x).cuda(device)
+        text_ir = torch.randn(1, 128, 128)
+        text_rgb = torch.randn(1, 128, 128)
+        with torch.cuda.device(input_data.get_device()):
+            self.val_func.eval()
+            self.val_func.to(input_data.get_device())
+            with torch.no_grad():
+                Fus_img, score, _ = self.val_func(input_data, input_modal_x, text_rgb, text_ir)
+                score = score[0]
+                if self.is_flip:
+                    input_data = input_data.flip(-1)
+                    input_modal_x = input_modal_x.flip(-1)
+                    score_flip, Fus_img_flip = self.val_func(input_data, input_modal_x)
+                    score_flip = score_flip[0]
+                    score += score_flip.flip(-1)
+                score = torch.exp(score)
+        
+        return score
+
+    # for rgbd segmentation
+    def process_image_rgbX(self, img, modal_x, crop_size=None):
+        p_img = img
+        p_modal_x = modal_x
+    
+        if img.shape[2] < 3:
+            im_b = p_img
+            im_g = p_img
+            im_r = p_img
+            p_img = np.concatenate((im_b, im_g, im_r), amodal_xis=2)
+    
+        p_img = normalize(p_img)
+        p_modal_x = normalize(p_modal_x)
+    
+        if crop_size is not None:
+            p_img, margin = pad_image_to_shape(p_img, crop_size, cv2.BORDER_CONSTANT, value=0)
+            p_modal_x, _ = pad_image_to_shape(p_modal_x, crop_size, cv2.BORDER_CONSTANT, value=0)
+            p_img = p_img.transpose(2, 0, 1)
+            if len(modal_x.shape) == 2:
+                p_modal_x = p_modal_x[np.newaxis, ...]
+            else:
+                p_modal_x = p_modal_x.transpose(2, 0, 1) # 3 H W
+        
+            return p_img, p_modal_x, margin
+    
+        p_img = p_img.transpose(2, 0, 1) # 3 H W
+
+        if len(modal_x.shape) == 2:
+            p_modal_x = p_modal_x[np.newaxis, ...]
+        else:
+            p_modal_x = p_modal_x.transpose(2, 0, 1)
+    
+        return p_img, p_modal_x

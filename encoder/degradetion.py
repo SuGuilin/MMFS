@@ -189,7 +189,7 @@ def random_swap(rgb, modal_x, beta=0.8):
     return rgb, modal_x
 
 
-model = DegradationModel().cuda()
+# model = DegradationModel().cuda()
 def convert_images_in_folder(input_folder, output_folder):
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)

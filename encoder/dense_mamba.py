@@ -1,15 +1,31 @@
 import sys
 
 sys.path.append("/home/suguilin/MMFS/")
+sys.path.append("/home/suguilin/zigma/")
+import os
 from torch import nn
 import torch
 from collections import OrderedDict
 import math
 from timm.models.layers import trunc_normal_
+import torchvision.transforms as transforms
 from mamba_ssm.modules.mamba_simple import Mamba
 from utils.utils import *
 from utils.modules import VSSBlock
-from encoder.cross_mamba import Fusion_Embed
+# from encoder.cross_mamba import Fusion_Embed
+from sklearn.decomposition import PCA
+from PIL import Image
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from sklearn.manifold import TSNE
+import numpy as np
+
+
+class SimpleGate(nn.Module):
+    def forward(self, x):
+        x1, x2 = x.chunk(2, dim=1)
+        return x1 * x2
+    
 
 class SimpleChannel(nn.Module):
     def __init__(self, in_chans, out_chans):
@@ -17,7 +33,8 @@ class SimpleChannel(nn.Module):
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
         self.conv1 = nn.Conv2d(in_chans, in_chans, 1)
-        self.conv2 = nn.Conv2d(in_chans, out_chans, 1)
+        self.conv2 = nn.Conv2d(in_chans, out_chans*2, kernel_size=3, padding=1, stride=1, groups=out_chans)
+        self.sg = SimpleGate()
         self.sigmoid = nn.Sigmoid()
         self.mlp = nn.Sequential(
                 nn.Conv2d(2, 4, 1),
@@ -35,6 +52,7 @@ class SimpleChannel(nn.Module):
     def forward(self, x):
         short_x = x
         x = self.conv2(x * self.sigmoid(self.conv1(self.avg_pool(x)) + self.conv1(self.max_pool(x))))
+        x = self.sg(x)
         x_mean_out = torch.mean(short_x, dim=1, keepdim=True)
         x_max_out, _ = torch.max(short_x, dim=1, keepdim=True)
         sp = self.mlp(torch.cat([x_mean_out, x_max_out], dim=1))
@@ -201,8 +219,8 @@ class TokenSwapMamba(nn.Module):
         super(TokenSwapMamba, self).__init__()
         self.encoder_x1 = Mamba(dim, bimamba_type=None)
         self.encoder_x2 = Mamba(dim, bimamba_type=None)
-        self.norm1 = LayerNorm(dim, 'with_bias')
-        self.norm2 = LayerNorm(dim, 'with_bias')
+        self.norm1 = nn.LayerNorm(dim) # LayerNorm(dim, 'with_bias')
+        self.norm2 = nn.LayerNorm(dim) # LayerNorm(dim, 'with_bias')
         self.ratio = nn.Parameter(torch.tensor(init_ratio))
     def forward(self, x):
         x1, x2 = x
@@ -226,10 +244,10 @@ class TokenSwapMamba(nn.Module):
 class CIM(nn.Module):
     def __init__(self, dim, compress_ratio=3, squeeze_factor=16, kernel_size=1, reduction=4):
         super(CIM, self).__init__()
-        self.channel_swap = nn.Sequential(
-            TokenSwapMamba(dim=dim),
-            TokenSwapMamba(dim=dim),
-        )
+        # self.channel_swap = nn.Sequential(
+        #     TokenSwapMamba(dim=dim),
+        #     TokenSwapMamba(dim=dim),
+        # )
         self.cab1 = CAB(num_feat=dim, compress_ratio=compress_ratio, squeeze_factor=squeeze_factor)
         self.cab2 = CAB(num_feat=dim, compress_ratio=compress_ratio, squeeze_factor=squeeze_factor)
         self.sab = SAB(kernel_size=kernel_size, reduction=reduction)
@@ -260,7 +278,7 @@ class CIM(nn.Module):
 
         x1_flat = x1.flatten(2).transpose(1, 2)  ##B H*W C
         x2_flat = x2.flatten(2).transpose(1, 2)  ##B H*W C
-        x1_flat, x2_flat = self.channel_swap([x1_flat, x2_flat])
+        # x1_flat, x2_flat = self.channel_swap([x1_flat, x2_flat])
         gated_weight = self.gate(torch.cat((x1_flat, x2_flat), dim=2))  ##B H*W C
         gated_weight = gated_weight.reshape(B, H, W, C).permute(0, 3, 1, 2).contiguous()  ## B C H W
 
@@ -351,7 +369,9 @@ class DenseMambaBlock(nn.Module):
             nn.Sequential(
                 Permute(0, 3, 1, 2),
                 # nn.Conv2d(dims[i] * (i + 2), dims[i], 3, 1, 1, padding_mode="reflect"), 
-                nn.Conv2d(dims[i] * (i + 2), dims[i], 1), 
+                # nn.Conv2d(dims[i] * (i + 2), dims[i], 1), 
+                (nn.Conv2d(dims[i] * (i + 2), dims[i], 1) 
+                if i != self.num_layers - 1 else SimpleChannel(dims[i] * (i + 2), dims[i])),
                 nn.ReLU(),
                 # SimpleChannel(dims[i] * (i + 2), dims[i]),
                 # MSDWConv(embed_dims=dims[i] * (i + 2), output_dims=dims[i]),
@@ -409,10 +429,11 @@ class DenseMambaBlock(nn.Module):
             outs.append(torch.cat([modal, outs[-1]], dim=3))
         # 这里的残差连接不知道影响不影响特征提取效果
         modal = modal + outs[0]
-        if self.id > 0 and self.id < 3:
-            return modal, outs, loss_aux
-        else:
-            return modal, loss_aux
+        return modal#, loss_aux
+        # if self.id > 0 and self.id < 3:
+        #     return modal, outs, loss_aux
+        # else:
+        #     return modal, loss_aux
 
 '''
 class DenseMamba(nn.Module):
@@ -683,8 +704,264 @@ class DenseMamba(nn.Module):
         return outs_rgb, outs_ir, branch_rgb, branch_ir, loss_aux
 
 
+class FeatureExtractor(nn.Module):
+    def __init__(self, model):
+        super(FeatureExtractor, self).__init__()
+        self.model = model
+        self.feature_maps = {
+            'outs_rgb': [],
+            'outs_ir': [],
+            'branch_rgb': [],
+            'branch_ir': []
+        }
+
+        # Register forward hooks for each submodule of the model
+        for name, module in self.model.named_modules():
+            module.register_forward_hook(self.save_feature(name))
+
+    def save_feature(self, name):
+        def hook(module, input, output):
+            if isinstance(output, tuple):
+                for idx, out in enumerate(output):
+                    if 'vssm_rgb' in name and idx == 0:  # 假设第一个是特征图
+                        self.feature_maps['outs_rgb'].append(out.detach().cpu())
+                    elif 'vssm_ir' in name and idx == 0:  # 假设第一个是特征图
+                        self.feature_maps['outs_ir'].append(out.detach().cpu())
+                    elif 'branch_rgb' in name and idx == 0:
+                        self.feature_maps['branch_rgb'].append(out.detach().cpu())
+                    elif 'branch_ir' in name and idx == 0:
+                        self.feature_maps['branch_ir'].append(out.detach().cpu())
+            else:
+                if 'vssm_rgb' in name:
+                    self.feature_maps['outs_rgb'].append(output.detach().cpu())
+                elif 'vssm_ir' in name:
+                    self.feature_maps['outs_ir'].append(output.detach().cpu())
+                elif 'branch_rgb' in name:
+                    self.feature_maps['branch_rgb'].append(output.detach().cpu())
+                elif 'branch_ir' in name:
+                    self.feature_maps['branch_ir'].append(output.detach().cpu())
+        return hook
+
+    def forward(self, rgb, ir):
+        outs_rgb, outs_ir, branch_rgb, branch_ir, loss_aux = self.model(rgb, ir)
+        return outs_rgb, outs_ir, branch_rgb, branch_ir, loss_aux
+    
+
+
+# def visualize_and_save_feature_maps(feature_maps, save_dir):
+#     fig = plt.figure(figsize=(16, 8))
+#     gs = gridspec.GridSpec(2, 7)
+
+#     # 显示原始图像
+#     ax = fig.add_subplot(gs[0, 0])
+#     ax.imshow(np.random.rand(128, 192), cmap='gray')
+#     ax.set_title('A young boy chases\nducks through the leaves.')
+#     ax.axis('off')
+
+#     # 可视化特征图
+#     for i, (name, maps) in enumerate(feature_maps.items()):
+#         for j, feature_map in enumerate(maps):
+#             ax = fig.add_subplot(gs[i, j + 1])
+#             ax.imshow(feature_map[0].detach().cpu().numpy(), cmap='viridis')
+#             ax.set_title(f"{name} [{j}]")
+#             ax.axis('off')
+
+#     plt.tight_layout()
+
+#     # 保存可视化结果
+#     os.makedirs(save_dir, exist_ok=True)
+#     plt.savefig(os.path.join(save_dir, 'feature_maps.png'))
+#     plt.close(fig)
+
+
+def visualize_and_save_feature_maps(feature_maps, save_dir):
+    os.makedirs(save_dir, exist_ok=True)
+
+    fig = plt.figure(figsize=(16, 8))
+    num_rows = len(feature_maps)  # 根据特征图数量动态调整行数
+    num_cols = max(len(maps) for maps in feature_maps.values())  # 动态获取最大列数
+    gs = gridspec.GridSpec(num_rows, num_cols)  # +1 为原图留出空间
+
+    # 显示原始图像
+    # ax = fig.add_subplot(gs[0, 0])
+    # ax.imshow(np.random.rand(128, 192), cmap='gray')
+    # ax.set_title('A young boy chases\nducks through the leaves.')
+    # ax.axis('off')
+
+    # 可视化特征图
+    for i, (name, maps) in enumerate(feature_maps.items()):
+        for j, feature_map in enumerate(maps):
+            ax = fig.add_subplot(gs[i, j + 1])
+            feature_map_np = feature_map[0].detach().cpu().numpy()
+            if feature_map_np.ndim == 3:  # 形状为 (C, H, W)
+                feature_map_np = feature_map_np.mean(axis=0)  # 取平均值以获得 2D 图像
+            
+            ax.imshow(feature_map_np, cmap='viridis')
+            ax.set_title(f"{name} [{j}]")
+            ax.axis('off')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'feature_maps.png'))
+    plt.close(fig)
+    
+
+# def visualize_feature_maps(feature_maps, save_dir):
+#     os.makedirs(save_dir, exist_ok=True)
+
+#     # 定义特征名称
+#     feature_names = ['outs_rgb', 'outs_ir', 'branch_rgb', 'branch_ir']
+
+#     # 计算总行数和最大列数
+#     total_plots = sum(len(feature_maps[name]) for name in feature_names)
+#     max_cols = max(len(feature_maps[name]) for name in feature_names)
+
+#     # 设置图像大小
+#     fig = plt.figure(figsize=(8 * max_cols, 4 * len(feature_names)))  # 增大图像尺寸
+
+#     # 初始化绘图行索引
+#     row_index = 0
+
+#     for name in feature_names:
+#         for i in range(len(feature_maps[name])):
+#             feature_map = feature_maps[name][i]
+#             feature_map_np = feature_map[0].detach().cpu().numpy()  # 选择 B=0
+
+#             # 归一化所有通道
+#             normalized_maps = []
+#             for channel in range(feature_map_np.shape[0]):
+#                 ch_map = feature_map_np[channel]
+#                 min_val = np.min(ch_map)
+#                 max_val = np.max(ch_map)
+
+#                 # 处理分母为零的情况
+#                 if max_val - min_val == 0:
+#                     normalized_map = np.zeros_like(ch_map)
+#                 else:
+#                     normalized_map = (ch_map - min_val) / (max_val - min_val)
+                
+#                 normalized_maps.append(normalized_map)
+
+#             # 叠加所有归一化后的通道
+#             heatmap = np.max(normalized_maps, axis=0)  # 选择最大值作为热力图
+
+#             # 绘制热力图
+#             ax = fig.add_subplot(len(feature_names), max_cols, row_index + 1)
+#             ax.imshow(heatmap, cmap='hot')
+#             ax.set_title(f"{name} Heatmap (index {i})", fontsize=12)
+#             ax.axis('off')
+
+#             row_index += 1
+
+#     plt.tight_layout()
+#     plt.savefig(os.path.join(save_dir, 'feature_maps_heatmap.png'))
+#     plt.close(fig)
+
+def visualize_feature_maps(feature_maps, feature_sizes, save_dir):
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 定义特征名称
+    feature_names = ['outs_rgb', 'outs_ir', 'branch_rgb', 'branch_ir']
+
+    # 计算总行数和最大列数
+    total_plots = sum(len(feature_maps[name]) for name in feature_names)
+    max_cols = max(len(feature_maps[name]) for name in feature_names)
+
+    # 设置图像大小
+    fig = plt.figure(figsize=(8 * max_cols, 4 * len(feature_names)))
+
+    # 初始化绘图行索引
+    row_index = 0
+
+    for name in feature_names:
+        for i in range(len(feature_maps[name])):
+            feature_map = feature_maps[name][i]
+            feature_map_size = feature_sizes[name][i]
+            feature_map_np = feature_map[0].detach().cpu().numpy()  # 选择 B=0
+
+            # 归一化所有通道
+            normalized_maps = []
+            for channel in range(feature_map_np.shape[0]):
+                ch_map = feature_map_np[channel]
+                min_val = np.min(ch_map)
+                max_val = np.max(ch_map)
+
+                # 处理分母为零的情况
+                if max_val - min_val == 0:
+                    normalized_map = np.zeros_like(ch_map)
+                else:
+                    normalized_map = (ch_map - min_val) / (max_val - min_val)
+                
+                normalized_maps.append(normalized_map)
+
+            # 叠加所有归一化后的通道
+            heatmap = np.max(normalized_maps, axis=0)  # 选择最大值作为热力图
+
+            # 绘制热力图
+            ax = fig.add_subplot(len(feature_names), max_cols, row_index + 1)
+            ax.imshow(heatmap, cmap='hot')
+            ax.set_title(f"{name} Heatmap (size {feature_map_size})", fontsize=12)
+            ax.axis('off')
+            ax.set_aspect('equal')
+
+            row_index += 1
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'feature_maps_heatmap.png'))
+    plt.close(fig)
+
+def visualize_feature_maps(feature_maps, save_dir):
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 定义特征名称
+    feature_names = ['outs_rgb', 'outs_ir', 'branch_rgb', 'branch_ir']
+
+    # 计算总的特征图数量
+    total_feature_maps = sum(len(feature_maps[name]) for name in feature_names)
+
+    # 设置图像大小
+    fig_cols = max(len(feature_maps[name]) for name in feature_names)  # 最大列数
+    fig_rows = len(feature_names)  # 行数
+    fig = plt.figure(figsize=(fig_cols * 4, fig_rows * 4))  # 根据列和行数设置图像大小
+
+    row_index = 0
+    for name in feature_names:
+        for i, feature_map in enumerate(feature_maps[name]):
+            feature_map_np = feature_map[0].detach().cpu().numpy()  # 选择 B=0
+
+            # 归一化所有通道
+            normalized_maps = []
+            for channel in range(feature_map_np.shape[0]):
+                ch_map = feature_map_np[channel]
+                min_val = np.min(ch_map)
+                max_val = np.max(ch_map)
+
+                # 处理分母为零的情况
+                if max_val - min_val == 0:
+                    normalized_map = np.zeros_like(ch_map)
+                else:
+                    normalized_map = (ch_map - min_val) / (max_val - min_val)
+                
+                normalized_maps.append(normalized_map)
+
+            # 叠加所有归一化后的通道
+            heatmap = np.max(normalized_maps, axis=0)
+
+            # 绘制热力图
+            ax = fig.add_subplot(fig_rows, fig_cols, row_index + 1)
+            ax.imshow(heatmap, cmap='hot')
+            ax.set_title(f"{name} Heatmap {i+1}", fontsize=10)
+            ax.axis('off')
+            ax.set_aspect('equal')
+
+            row_index += 1
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'feature_maps_heatmap.png'))
+    plt.close(fig)
+
 
 if __name__ == '__main__':
+    '''
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = DenseMamba().to(device)
     # change = ChannelExchange()
@@ -707,3 +984,81 @@ if __name__ == '__main__':
     for m in fused:
         print(m.shape)
     # print(y[1].shape)
+    '''
+    input_image_rgb = Image.open('00003N_vi.png')
+    input_image_ir = Image.open('00003N_ir.png').convert('RGB')
+
+    transform = transforms.Compose([
+        transforms.Resize((480, 640)),  
+        transforms.ToTensor(),
+    ])
+
+    input_tensor_rgb = transform(input_image_rgb).unsqueeze(0).cuda(1)
+    input_tensor_ir = transform(input_image_ir).unsqueeze(0).cuda(1)
+
+    # 使用 DenseMamba 模型和特征提取器
+    model = DenseMamba().cuda(1)
+    feature_extractor = FeatureExtractor(model)
+
+    # 获取模型输出
+    outs_rgb, outs_ir, branch_rgb, branch_ir, loss_aux = feature_extractor(input_tensor_rgb, input_tensor_ir)
+
+    # 创建保存目录
+    save_dir = 'feature_visualizations'
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 可视化特征图
+    for i, (rgb_out, ir_out) in enumerate(zip(outs_rgb, outs_ir)):
+        rgb_out = rgb_out.detach().cpu().numpy()  
+        print(f"Layer {i} RGB output shape: {rgb_out.shape}")  
+
+        rgb_out = rgb_out.squeeze(0)  
+        features_rgb = rgb_out.reshape(rgb_out.shape[0], -1).T  # (height * width, channels)
+
+        # apply PCA
+        pca_rgb = PCA(n_components=3)
+        rgb_pca = pca_rgb.fit_transform(features_rgb)
+
+        # normization
+        rgb_pca = (rgb_pca - rgb_pca.min()) / (rgb_pca.max() - rgb_pca.min())
+        rgb_image = rgb_pca.reshape(rgb_out.shape[1], rgb_out.shape[2], 3)  # (height, width, 3)
+
+        plt.imshow(rgb_image)
+        plt.axis('off')
+        plt.title(f'PCA Visualization of RGB Layer {i}')
+        plt.savefig(f'{save_dir}/rgb_layer_{i}.png', bbox_inches='tight')
+        plt.close()
+
+        # 处理 IR 输出
+        ir_out = ir_out.detach().cpu().numpy()  # 转换为 NumPy 数组
+        print(f"Layer {i} IR output shape: {ir_out.shape}")
+
+        ir_out = ir_out.squeeze(0)  # 去掉 batch_size 维度
+        features_ir = ir_out.reshape(ir_out.shape[0], -1).T  # (height * width, channels)
+
+        # 应用 PCA
+        pca_ir = PCA(n_components=3)
+        ir_pca = pca_ir.fit_transform(features_ir)
+
+        # 归一化
+        ir_pca = (ir_pca - ir_pca.min()) / (ir_pca.max() - ir_pca.min())
+        ir_image = ir_pca.reshape(ir_out.shape[1], ir_out.shape[2], 3)  # (height, width, 3)
+
+        # 保存 IR 图像
+        plt.imshow(ir_image)
+        plt.axis('off')
+        plt.title(f'PCA Visualization of IR Layer {i}')
+        plt.savefig(f'{save_dir}/ir_layer_{i}.png', bbox_inches='tight')
+        plt.close()
+
+    print(f"Visualizations saved to {save_dir} directory.")
+
+    feature_maps = {
+    'outs_rgb': outs_rgb,
+    'outs_ir': outs_ir,
+    'branch_rgb': branch_rgb,
+    'branch_ir': branch_ir
+    }
+
+    visualize_and_save_feature_maps(feature_maps, save_dir)
+    visualize_feature_maps(feature_maps, save_dir)

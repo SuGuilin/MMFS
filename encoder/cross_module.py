@@ -1,6 +1,6 @@
 import sys
 
-sys.path.append("/home/suguilin/Graduation/myfusion/")
+sys.path.append("/home/suguilin/MMFS/")
 sys.path.append("/home/suguilin/zigma/")
 import math
 import torch
@@ -15,8 +15,11 @@ from functools import partial
 from typing import Optional, Callable, Any
 from collections import OrderedDict
 from utils.utils import *
-from utils.modules import Mlp, CAB
-
+from utils.modules import Mlp, CAB, LayerNorm
+from encoder.dense_mamba import DenseMambaBlock, CIM
+from net.IRNet import VMBlock
+from net.FreqLearning import ResMoEBlock
+from fusion.AttentionFusion import DynamicFusionModule
 
 class SS2D(nn.Module):
     def __init__(
@@ -58,7 +61,7 @@ class SS2D(nn.Module):
         self.K = 4 if not shared_ssm else 1
 
         self.in_proj = nn.Linear(
-            self.d_model * d_model_rate, self.d_inner, bias=bias, **factory_kwargs
+            self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs
         )
         self.conv2d = nn.Conv2d(
             in_channels=self.d_inner,
@@ -113,8 +116,8 @@ class SS2D(nn.Module):
 
         if not self.softmax_version:
             self.out_norm = nn.LayerNorm(self.d_inner)
-        # self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
-        # self.dropout = nn.Dropout(dropout) if dropout > 0. else None
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        self.dropout = nn.Dropout(dropout) if dropout > 0. else None
 
     @staticmethod
     def dt_init(
@@ -250,17 +253,17 @@ class SS2D(nn.Module):
     forward_core = forward_corev0
 
     def forward(self, x: torch.Tensor, **kwargs):
-        x = self.in_proj(x)
-        # x, z = xz.chunk(2, dim=-1) # (b, h, w, d)
+        xz = self.in_proj(x)
+        x, z = xz.chunk(2, dim=-1) # (b, h, w, d)
 
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.act(self.conv2d(x))  # (b, d, h, w)
         y = self.forward_core(x)  # SSM
-        # y = y * F.silu(z)
-        # out = self.out_proj(y)
-        # if self.dropout is not None:
-        #     out = self.dropout(out)
-        return y
+        y = y * F.silu(z)
+        out = self.out_proj(y)
+        if self.dropout is not None:
+            out = self.dropout(out)
+        return out
 
 class ChannelAttention(nn.Module):
     def __init__(self, dim, reduction=4):
@@ -379,7 +382,7 @@ class CrossBlock(nn.Module):
         self.norm_share = norm_layer(hidden_dim * d_model_rate)
         self.op_share = SS2D(
             d_model=hidden_dim,
-            d_model_rate=d_model_rate,
+            d_model_rate=1,
             dropout=attn_drop_rate,
             d_state=d_state,
             ssm_ratio=ssm_ratio,
@@ -530,6 +533,7 @@ class CrossFusionBlock(nn.Module):
         **kwargs,
     ):
         super().__init__()
+        '''
         self.modals = modals
         d_model_rate = self.modals
         
@@ -541,46 +545,69 @@ class CrossFusionBlock(nn.Module):
         self.conv_blk = nn.ModuleList()
 
         for _ in range(self.modals):
-            self.norm1.append(norm_layer(hidden_dim))            
-            self.FFN.append(
-                nn.Sequential(
-                    Permute(0, 3, 1, 2),
-                    Mlp(in_features=hidden_dim, out_fratures=hidden_dim, ffn_expansion_factor=4),
-                    Permute(0, 2, 3, 1),
-                )
-            )
+            # self.norm1.append(norm_layer(hidden_dim))            
+            # self.FFN.append(
+            #     nn.Sequential(
+            #         Permute(0, 3, 1, 2),
+            #         Mlp(in_features=hidden_dim, out_fratures=hidden_dim, ffn_expansion_factor=4),
+            #         Permute(0, 2, 3, 1),
+            #     )
+            # )
 
             self.norm2.append(norm_layer(hidden_dim))
             self.op.append(
-                SS2D(
-                    d_model=hidden_dim,
-                    d_model_rate=1,
-                    dropout=attn_drop_rate,
-                    d_state=d_state,
-                    ssm_ratio=ssm_ratio,
-                    dt_rank=dt_rank,
-                    shared_ssm=shared_ssm,
-                    softmax_version=softmax_version,
-                    **kwargs,
-                )
+                # SS2D(
+                #     d_model=hidden_dim,
+                #     d_model_rate=1,
+                #     dropout=attn_drop_rate,
+                #     d_state=d_state,
+                #     ssm_ratio=ssm_ratio,
+                #     dt_rank=dt_rank,
+                #     shared_ssm=shared_ssm,
+                #     softmax_version=softmax_version,
+                #     **kwargs,
+                # )
+                DenseMambaBlock(dims=hidden_dim),
+                
             )
 
-            self.norm3.append(norm_layer(hidden_dim*2))
+            self.norm3.append(norm_layer(hidden_dim))
             self.conv_blk.append(
                 nn.Sequential(
                     Permute(0, 3, 1, 2),
-                    CAB(hidden_dim * 2),
+                    CAB(hidden_dim),
                     Permute(0, 2, 3, 1),
                 )    
             )
-
+        '''
+        self.cim = CIM(dim=hidden_dim)
+        self.dynamic_fusion = DynamicFusionModule(embed_size=hidden_dim)
+        self.resvm = nn.ModuleList([
+            nn.Sequential(
+                ResMoEBlock(
+                    in_ch=hidden_dim * 2,
+                    num_experts=4,
+                    use_shuffle=True,
+                    lr_space=1,
+                    topk=2,
+                    recursive=2,
+                ),
+                VMBlock(
+                    hidden_dim=hidden_dim * 2,
+                    ffn_expansion_factor=2,
+                    bias=False,
+                    LayerNorm_type="WithBias",
+                )
+            ) for _ in range(3) 
+        ])
+        '''
         self.norm = norm_layer(hidden_dim * d_model_rate)  
         self.mlp = nn.Sequential(
             Permute(0, 3, 1, 2),
-            Mlp(in_features=hidden_dim * 2, out_fratures=hidden_dim * 2, ffn_expansion_factor=4),
+            Mlp(in_features=hidden_dim * 2, out_fratures=hidden_dim, ffn_expansion_factor=4),
             Permute(0, 2, 3, 1),
         )
-        self.norm_share = norm_layer(hidden_dim * d_model_rate)            
+        self.norm_share = norm_layer(hidden_dim)            
         self.op_share = SS2D(
             d_model=hidden_dim,
             d_model_rate=d_model_rate,
@@ -592,29 +619,34 @@ class CrossFusionBlock(nn.Module):
             softmax_version=softmax_version,
             **kwargs,
         )
-        self.linear = nn.Linear(hidden_dim * d_model_rate, hidden_dim * d_model_rate)
+        # self.conv_blk_share = nn.Sequential(
+        #             Permute(0, 3, 1, 2),
+        #             CAB(hidden_dim),
+        #             Permute(0, 2, 3, 1),
+        #         )    
+        self.linear = nn.Linear(hidden_dim, hidden_dim)
         self.proj = nn.Sequential(
-            nn.Linear(hidden_dim * d_model_rate, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
         
-        self.conv1 = nn.Sequential(
-            Permute(0, 3, 1, 2),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(hidden_dim * 2, hidden_dim * 2, kernel_size=1),
-            Permute(0, 2, 3, 1),
-        )
-        self.conv2 = nn.Sequential(
-            Permute(0, 3, 1, 2),
-            nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=1),
-            Permute(0, 2, 3, 1),
-        )
-        
-        self.norm_layer = norm_layer(hidden_dim) #nn.BatchNorm2d(hidden_dim)
+        # self.conv1 = nn.Sequential(
+        #     Permute(0, 3, 1, 2),
+        #     nn.AdaptiveAvgPool2d(1),
+        #     nn.Conv2d(hidden_dim * 2, hidden_dim * 2, kernel_size=1),
+        #     Permute(0, 2, 3, 1),
+        # )
+        # self.conv2 = nn.Sequential(
+        #     Permute(0, 3, 1, 2),
+        #     nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=1),
+        #     Permute(0, 2, 3, 1),
+        # )
+        '''
+        self.norm_layer = LayerNorm(hidden_dim*2, "WithBias") # norm_layer(hidden_dim) #nn.BatchNorm2d(hidden_dim)
         self.dwconv = nn.Sequential(
-            Permute(0, 3, 1, 2),
-            nn.Conv2d(hidden_dim, hidden_dim, 3, 1, 1, bias=True, groups=hidden_dim, padding_mode="reflect"),
+            # Permute(0, 3, 1, 2),
+            nn.Conv2d(hidden_dim*2, hidden_dim, 3, 1, 1, bias=True, groups=hidden_dim, padding_mode="reflect"),
             nn.GELU(),
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1),
         ) 
@@ -637,6 +669,7 @@ class CrossFusionBlock(nn.Module):
                 m.bias.data.zero_()
 
     def forward(self, x1, x2):
+        '''
         x1 = x1.permute(0, 2, 3, 1)
         x2 = x2.permute(0, 2, 3, 1)
 
@@ -647,19 +680,28 @@ class CrossFusionBlock(nn.Module):
         x1_short = x1
         x2_short = x2
 
-        g = self.linear(x) # F.sigmoid(x)
-        x1 = self.FFN[0](self.norm1[0](x1))
-        x1 = self.op[0](self.norm2[0](x1))
+        g = self.linear(x) # # F.sigmoid(x) self.conv_blk_share(x)
+        # x1 = self.FFN[0](self.norm1[0](x1))
+        x1, _ = self.op[0](x1) # self.op[0](self.norm2[0](x1))
+        x2, _ = self.op[1](x2)
+        x1, x2 = self.cim(x1.permute(0, 3, 1, 2), x2.permute(0, 3, 1, 2))
+        x1 = x1.permute(0, 2, 3, 1)
+        x2 = x2.permute(0, 2, 3, 1)
         x1 = self.conv_blk[0](self.norm3[0](x1))
 
-        x2 = self.FFN[1](self.norm1[1](x2))
-        x2 = self.op[1](self.norm2[1](x2))
+        # x2 = self.FFN[1](self.norm1[1](x2))
+        # x2 = self.op[1](self.norm2[1](x2))
         x2 = self.conv_blk[1](self.norm3[1](x2))
 
         x = g * x1 + g * x2
         x = self.proj(x) + x1_short + x2_short
         # residual = self.conv2(self.conv1(x_short) * x_short)
-
+        '''
+        x1, x2 = self.cim(x1, x2)
+        # x = self.dynamic_fusion(x1, x2)
+        x = torch.cat([x1, x2], dim=1)
+        for i in range(3): 
+            x = self.resvm[i](x)
         x = self.dwconv(self.norm_layer(x))
         return x
 
@@ -691,6 +733,6 @@ if __name__ == "__main__":
     ir = torch.randn(1, 96, 120, 160).to(device)
     # rgb, ir = model(rgb.to(device), ir.to(device))
     fused = model(rgb, ir)
-    print(fused.shape)
-    print(rgb.shape)
-    print(ir.shape)
+    # print(fused.shape)
+    # print(rgb.shape)
+    # print(ir.shape)
