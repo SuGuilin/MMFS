@@ -17,8 +17,9 @@ from collections import OrderedDict
 from utils.utils import *
 from utils.modules import Mlp, CAB, LayerNorm
 from encoder.dense_mamba import DenseMambaBlock, CIM
-from net.IRNet import VMBlock
+from net.IRNet import VMBlock, FreModule
 from net.FreqLearning import ResMoEBlock
+from net.arch import CMLLFF
 from fusion.AttentionFusion import DynamicFusionModule
 
 class SS2D(nn.Module):
@@ -581,11 +582,13 @@ class CrossFusionBlock(nn.Module):
             )
         '''
         self.cim = CIM(dim=hidden_dim)
-        self.dynamic_fusion = DynamicFusionModule(embed_size=hidden_dim)
+        self.CMLLFF = CMLLFF(embed_dims=hidden_dim)
+
+        # self.dynamic_fusion = DynamicFusionModule(embed_size=hidden_dim)
         self.resvm = nn.ModuleList([
             nn.Sequential(
                 ResMoEBlock(
-                    in_ch=hidden_dim * 2,
+                    in_ch=hidden_dim,
                     num_experts=4,
                     use_shuffle=True,
                     lr_space=1,
@@ -593,13 +596,14 @@ class CrossFusionBlock(nn.Module):
                     recursive=2,
                 ),
                 VMBlock(
-                    hidden_dim=hidden_dim * 2,
-                    ffn_expansion_factor=2,
+                    hidden_dim=hidden_dim,
+                    ffn_expansion_factor=4,
                     bias=False,
                     LayerNorm_type="WithBias",
                 )
-            ) for _ in range(3) 
+            ) for _ in range(2) 
         ])
+        self.fre = FreModule(dim=hidden_dim*2, num_heads=8, bias=False, in_dim=hidden_dim*2)
         '''
         self.norm = norm_layer(hidden_dim * d_model_rate)  
         self.mlp = nn.Sequential(
@@ -615,6 +619,7 @@ class CrossFusionBlock(nn.Module):
             d_state=d_state,
             ssm_ratio=ssm_ratio,
             dt_rank=dt_rank,
+
             shared_ssm=shared_ssm,
             softmax_version=softmax_version,
             **kwargs,
@@ -697,13 +702,19 @@ class CrossFusionBlock(nn.Module):
         x = self.proj(x) + x1_short + x2_short
         # residual = self.conv2(self.conv1(x_short) * x_short)
         '''
-        x1, x2 = self.cim(x1, x2)
+        # x1 = self.resvm[0](x1)
+        # x2 = self.resvm[1](x2)
+        # x1, x2 = self.cim(x1, x2)
+        x1, x2 = self.CMLLFF(x1, x2)
         # x = self.dynamic_fusion(x1, x2)
         x = torch.cat([x1, x2], dim=1)
-        for i in range(3): 
-            x = self.resvm[i](x)
+        # short_x = x
+        # for i in range(2): 
+        #     x = self.resvm[i](x)
+        # x = self.fre(short_x, x)
         x = self.dwconv(self.norm_layer(x))
         return x
+        
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

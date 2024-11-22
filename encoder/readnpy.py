@@ -1,7 +1,7 @@
 import numpy as np
 
 # 替换为你的 .npy 文件路径
-file_path = '01598D.npy'
+file_path = '/home/suguilin/MMFS/datasets/MFNet/Text_Bert/Modal/00001D.npy'
 
 # 读取 .npy 文件
 data = np.load(file_path)

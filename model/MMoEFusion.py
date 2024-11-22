@@ -20,13 +20,168 @@ from utils.modules import Restormer_CNN_block
 from utils.NAFBlock import NAFBlock
 from utils.MixBlock import MixBlock
 from memory_profiler import profile
-from classification.models.vmamba import Backbone_VSSM
+from net.FeaLearning import FeaLearning
+from net.SparseMoEBlock import SparseMoEBlock
+from net.arch import LoraMoEBlock, LinearAttention, DetailFeatureExtraction, TDE, RSE
+from classification.models.vmamba import VSSM, LayerNorm2d
+from timm.models.layers import trunc_normal_
+from easydict import EasyDict as edict
+import yaml
+import cv2
+import numpy as np
+
+# compatible with openmmlab
+class Backbone_VSSM(VSSM):
+    def __init__(self, config, device, out_indices=(0, 1, 2, 3), pretrained=None, norm_layer="ln", **kwargs):
+        kwargs.update(norm_layer=norm_layer)
+        super().__init__(**kwargs)
+        self.channel_first = (norm_layer.lower() in ["bn", "ln2d"])
+        _NORMLAYERS = dict(
+            ln=nn.LayerNorm,
+            ln2d=LayerNorm2d,
+            bn=nn.BatchNorm2d,
+        )
+        norm_layer: nn.Module = _NORMLAYERS.get(norm_layer.lower(), None)        
+        
+        self.out_indices = out_indices
+        for i in out_indices:
+            layer = norm_layer(self.dims[i])
+            layer_name = f'outnorm{i}'
+            self.add_module(layer_name, layer)
+
+        del self.classifier
+        self.load_pretrained(pretrained)
+
+        # Initialize FeaLearning
+        # self.fea_learning = nn.ModuleList([
+        #     FeaLearning(num_channels=self.dims[i])
+        #     for i in range(4)
+        # ])
+        # if self.training:
+        #     gate_size = int(config.batch_size * config.image_height * config.image_width / 16)
+        #     # print("train", gate_size)
+        # else:
+        #     gate_size = int(config.eval_crop_size[0] * config.eval_crop_size[1])
+            # print("eval", gate_size)
+        self.linearAtt = nn.ModuleList([
+            # SparseMoEBlock(gate_size=gate_size / (self.dims[i] / self.dims[0]) ** 2, device=device, atom_dim=768, dim=self.dims[i], ffn_expansion_factor=4)
+            LinearAttention(dim=self.dims[i], num_heads=8)
+            for i in range(4)
+        ])
+
+        self.DetailExtra = nn.ModuleList([
+            # SparseMoEBlock(gate_size=gate_size / (self.dims[i] / self.dims[0]) ** 2, device=device, atom_dim=768, dim=self.dims[i], ffn_expansion_factor=4)
+            DetailFeatureExtraction(dim=self.dims[i])
+            for i in range(4)
+        ])
+        
+        self.fea_learning = nn.ModuleList([
+            # SparseMoEBlock(gate_size=gate_size / (self.dims[i] / self.dims[0]) ** 2, device=device, atom_dim=768, dim=self.dims[i], ffn_expansion_factor=4)
+            LoraMoEBlock(config=config, final_embed_dim=self.dims[i])
+            for i in range(4)
+        ])
+
+        self.conv1 = nn.ModuleList([
+            nn.Conv2d(self.dims[i]*2, self.dims[i], 1)
+            for i in range(4)
+        ])
+        self.conv2 = nn.ModuleList([
+            nn.Conv2d(self.dims[i]*2, self.dims[i], 1)
+            for i in range(4)
+        ])
+
+        self.TDE = nn.ModuleList([
+            TDE(self.dims[i], self.dims[i])
+            for i in range(2)
+        ])
+        self.RSE = nn.ModuleList([
+            RSE(self.dims[i], self.dims[i])
+            for i in range(2, 4)
+        ])
+
+    def load_pretrained(self, ckpt=None, key="model"):
+        if ckpt is None:
+            return
+        
+        try:
+            _ckpt = torch.load(open(ckpt, "rb"), map_location=torch.device("cpu"))
+            print(f"Successfully load ckpt {ckpt}")
+            incompatibleKeys = self.load_state_dict(_ckpt[key], strict=False)
+            print(incompatibleKeys)        
+        except Exception as e:
+            print(f"Failed loading checkpoint form {ckpt}: {e}")
+
+    def forward(self, rgb_input, thermal_input, rgb_text, thermal_text):
+        def layer_forward(l, x):
+            x = l.blocks(x)
+            y = l.downsample(x)
+            return x, y
+
+        rgb_out = self.patch_embed(rgb_input)
+        thermal_out = self.patch_embed(thermal_input)
+        loss_aux = 0
+
+        outs_rgb = []
+        outs_thermal = []
+        for i, layer in enumerate(self.layers):
+            # if i == 0:
+            #     cv2.imwrite('rgb_shallow.png', rgb_out[0][0].detach().squeeze(0).cpu().numpy() * 255)
+            #     cv2.imwrite('ir_shallow.png', thermal_out[0][0].detach().squeeze(0).cpu().numpy() * 255)
+            # if i == 3:
+            #     cv2.imwrite('rgb_deep.png', rgb_out[0][0].detach().squeeze(0).cpu().numpy() * 255)
+            #     cv2.imwrite('ir_deep.png', thermal_out[0][0].detach().squeeze(0).cpu().numpy() * 255)
+            # Feature Regulation
+            # rgb_out, thermal_out = self.fea_learning[i](rgb_out, thermal_out)
+            # rgb_out, loss_rgb = self.fea_learning[i](rgb_out, rgb_text)
+            # thermal_out, loss_thermal = self.fea_learning[i](thermal_out, thermal_text)
+            b, c, h, w = rgb_out.shape
+            
+            rgb_features, rgb_out = layer_forward(layer, rgb_out) 
+            thermal_features, thermal_out = layer_forward(layer, thermal_out) # (B, H, W, C)
+            # rgb_features, thermal_features = self.linearAtt[i](rgb_features.view(b, c, -1).permute(0, 2 ,1), thermal_features.view(b, c, -1).permute(0, 2 ,1), h, w)
+            rgb_features = self.fea_learning[i](rgb_features, 'visible')
+            thermal_features = self.fea_learning[i](thermal_features, 'thermal')
+            if i < 2:
+                thermal_features = self.TDE[i](rgb_features, thermal_features)
+            
+            if i > 1:
+                rgb_features = self.RSE[i - 2](rgb_features, thermal_features)
+            
+            rgb_features_1 = self.linearAtt[i](rgb_features.view(b, c, -1).permute(0, 2 ,1), h, w)
+            rgb_features_2 = self.DetailExtra[i](rgb_features)
+            thermal_features_1 = self.linearAtt[i](thermal_features.view(b, c, -1).permute(0, 2 ,1), h, w)
+            thermal_features_2 = self.DetailExtra[i](thermal_features)
+
+            # rgb_features = rgb_features_1 + thermal_features_1
+            # thermal_features = rgb_features_2 + thermal_features_2
+            rgb_features = torch.cat([rgb_features_1, rgb_features_2], dim=1)
+            thermal_features = torch.cat([thermal_features_1, thermal_features_2], dim=1)
+            rgb_features = self.conv1[i](rgb_features)
+            thermal_features = self.conv2[i](thermal_features)
+            
+            if i in self.out_indices:
+                norm_layer = getattr(self, f'outnorm{i}')
+                rgb_norm_out = norm_layer(rgb_features)
+                thermal_norm_out = norm_layer(thermal_features)
+                # rgb_norm_out, thermal_norm_out = self.fea_learning[i](rgb_norm_out, thermal_norm_out)
+                if not self.channel_first:
+                    rgb_norm_out = rgb_norm_out.permute(0, 2, 3, 1)
+                    thermal_norm_out = thermal_norm_out.permute(0, 2, 3, 1)
+                outs_rgb.append(rgb_norm_out.contiguous())
+                outs_thermal.append(thermal_norm_out.contiguous())
+            # loss_aux = loss_aux + (loss_rgb + loss_thermal)
+
+        if len(self.out_indices) == 0:
+            return rgb_out, thermal_out
+        
+        return outs_rgb, outs_thermal, loss_aux
 
 
 class MMoEFusion(nn.Module):
     def __init__(
         self,
         device,
+        config,
         num_classes=9,
         embed_dim=768, #384,
         patch_size=4,
@@ -59,6 +214,8 @@ class MMoEFusion(nn.Module):
         # )
         channel_first = True
         self.backbone = Backbone_VSSM(
+            config=config,
+            device=device,
             pretrained='/home/suguilin/MMFS/pretrained/classification/vssm1_tiny_0230s_ckpt_epoch_264.pth',
             # pretrained=None,
             depths=[2, 2, 8, 2], dims=96, drop_path_rate=0.2, 
@@ -120,10 +277,12 @@ class MMoEFusion(nn.Module):
         )
         # self.final_up = Upsample_X4(dims[-1] * 2, out_chans)
         self.final_up = Upsample_X4(dims[-1], out_chans)
+        self.tanh_layer = nn.Tanh()
         # self.decoder = nn.Conv2d(dims[-1] // 4, out_chans, 3, 1, 1)
 
         self.decoder = nn.Sequential(
-            nn.Conv2d(3 * 3, dims[-1], 1),
+            nn.Conv2d(3 * 3, dims[-1], kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(dims[-1]),
             # nn.Conv2d(dims[-1] * 3, dims[-1] // 2, 1),
             nn.LeakyReLU(negative_slope=0.2, inplace=True),
             # nn.Conv2d(dims[-1] // 2, dims[-1] // 4, 3, 1, 1),
@@ -160,8 +319,12 @@ class MMoEFusion(nn.Module):
         # print("after:", rgb.shape, ir.shape)
         # outs_rgb, outs_ir, branch_rgb, branch_ir, loss_aux = self.backbone(rgb, ir)
         loss_aux = 0
-        outs_rgb = self.backbone(rgb)
-        outs_ir = self.backbone(ir)
+        # outs_rgb = self.backbone(rgb)
+        # outs_ir = self.backbone(ir)
+        outs_rgb, outs_ir, loss_aux = self.backbone(rgb, ir, text_rgb, text_ir)
+        # cv2.imwrite('rgb_1.png', outs_rgb[0][0][0].detach().squeeze(0).cpu().numpy() * 255)
+        # cv2.imwrite('ir_1.png', outs_ir[0][0][0].detach().squeeze(0).cpu().numpy() * 255)
+
         B, C, H, W = outs_rgb[0].shape
         # print("dense:", rgb_dense.shape, ir_dense.shape)
         # _, _, bert_rgb = self.textencoder(text_rgb)
@@ -271,18 +434,28 @@ class MMoEFusion(nn.Module):
         # fused = self.final_up(torch.cat([y_global, y_local], dim=1))
         fused = self.final_up(self.conv_before_upsample(fused))
         fused = self.decoder(torch.cat([fused, rgb, ir], dim=1))
+        # fused = self.tanh_layer(fused)
         # print(fused.shape)
         # res = self.decoder(fused)
         return fused, seg_out, loss_aux#, deg_rgb, deg_ir #res#, load_loss
 
 
 if __name__ == "__main__":
-    device = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
+    
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
     print(device)
-    model = MMoEFusion(device=device).to(device)
+    def load_config(yaml_path):
+        with open(yaml_path, "r") as f:
+            config = yaml.safe_load(f)
+        return edict(config)
+    config_path = '../configs/config_mfnet.yaml'
+    config = load_config(config_path)
+    model = MMoEFusion(device=device, config=config).to(device)
     model.eval()
-    rgb = torch.randn(2, 3, 288, 384).to(device)
-    ir = torch.randn(2, 1, 288, 384).to(device)
+    rgb = torch.from_numpy(cv2.imread('rgb.png', 1).astype(np.float32)).unsqueeze(0).permute(0, 3, 1, 2).to(device) #torch.randn(1, 3, 480, 640).to(device)
+    ir = torch.from_numpy(cv2.imread('thermal.png', 1).astype(np.float32)).unsqueeze(0).permute(0, 3, 1, 2).to(device) #torch.randn(1, 3, 480, 640).to(device)
+    print(rgb.shape)
+    print(ir.shape)
     # text_rgb = [
     #     ['In this image with a resolution of 384X288, we can see a person walking down a street at night. The dense caption provides further details about the various objects present. A woman can be seen walking on the road, positioned between coordinates [97, 76, 171, 248]. Another person is also depicted walking, located at coordinates [256, 98, 276, 163]. A grey backpack can be observed on a person, positioned between coordinates [123, 110, 164, 173]. Moreover, a car is parked on the side of the road, situated at coordinates [63, 116, 111, 164]. Additionally, the region semantic provides additional information about different elements in the image. A woman is depicted walking with a suitcase between coordinates [0, 149, 383, 137]. There is also a black and white photo of a man standing in front of a wall, positioned at [341, 50, 42, 95]. Furthermore, a black object on a black background can be seen at coordinates [101, 169, 65, 45]. Additionally, a black and white photo of a building can be found, wherein the lights are on. It is located at [0, 97, 72, 33]. Lastly, a white figure is depicted against a black background, positioned at [124, 101, 38, 71].'], 
     #     ['In this 384x288 resolution image, a street scene unfolds before our eyes. Cars are parked in front of a building, creating a bustling urban atmosphere. A white car can be observed parked on the side of the road, specifically positioned between coordinates (272, 142) and (343, 185). Another car, described as being white, can also be found parked along the roadside, with its positioning spanning from (251, 148) to (278, 175). As we shift our attention towards the road, we notice the presence of white lines, stretching from (2, 186) to (185, 288). These lines guide the flow of traffic and add structure to the scene. Adjacent to the road, trees are visible on the sidewalk, occupying an area defined by the coordinates (1, 1) and (230, 175). Additional white lines grace the road, spanning from (1, 168) to (380, 288), delineating the various lanes for vehicles. Lastly, we can identify a sole white line adorning the road, positioned between coordinates (276, 208) and (371, 231). This image paints a vivid picture of an urban street, emphasizing the presence of cars, road markings, and greenery along the sidewalk.'], 
@@ -291,12 +464,12 @@ if __name__ == "__main__":
     #     ['In this 384X288 resolution image, the captivating scene unfolds at night as two people gracefully walk down a dimly lit street. The dense caption brings additional insight, revealing a person confidently strolling on the sidewalk, a woman in a white shirt nearby, and another person standing nearby. In the foreground, a white line appears, marking the side of the road. The region semantics provide a different perspective, describing the image as two people traversing a dark road at night, with a man standing against a black background. Additionally, a long black object with a long handle is present, while a black and white photo showcases a person standing on a hill. Adding to the intriguing composition, a black piano sits upon a black background. These elements coalesce within the image, inviting viewers to appreciate the beauty and serenity of nature blending seamlessly with human presence in the enigmatic night.'], 
     #     ['In this image, the resolution is 384X288, capturing a large building. The dense caption reveals various elements within the scene: a person can be seen walking on the sidewalk, while another stands in the distance. A long asphalt road stretches across the frame, accompanied by lush green grass on one side. Trees line the street, adding a touch of nature to the urban setting. Switching to the region semantic, a dark hallway comes into focus, with a person walking down it. Additionally, a green bush catches the eye, featuring a lighted area at its center. A single green leaf stands out against a black background. Finally, a picture of a gold and black square and a yellow light shining on a black background add visual interest to the overall composition.']
     # ]
-    text_rgb = torch.randn(2, 256, 768).to(device)
-    text_ir = torch.randn(2, 256, 768).to(device)
+    text_rgb = torch.randn(1, 256, 768).to(device)
+    text_ir = torch.randn(1, 256, 768).to(device)
     # text_rgb = [
     # out, load_loss = model(rgb, ir, text_rgb, text_ir)
     # fused, seg_out, param_rgb, param_ir = model(rgb, ir, text_rgb, text_ir)
-    fused, seg_out = model(rgb, ir, text_rgb, text_ir)
+    fused, seg_out, _ = model(rgb, ir, text_rgb, text_ir)
 
     print(fused.shape)
     print(seg_out.shape)

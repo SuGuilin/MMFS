@@ -4,7 +4,7 @@ sys.path.append("/home/suguilin/VMamba/")
 import time
 import argparse
 from tqdm import tqdm
-from transformers import Blip2Processor, Blip2ForConditionalGeneration
+# from transformers import Blip2Processor, Blip2ForConditionalGeneration
 
 import torch
 import torch.nn as nn
@@ -16,7 +16,7 @@ from dataloader.dataloader import get_train_loader
 from dataloader.RGBXDataset import RGBXDataset
 from dataloader.dataloader import ValPre
 
-from utils.loss import Fusionloss, cc, SSIMLoss, RGBLoss, total_variation_loss, DegradationLoss, MakeFusionLoss
+from utils.loss import Fusionloss, cc, SSIMLoss, RGBLoss, total_variation_loss, DegradationLoss, MakeFusionLoss, language_driven_fusion_loss
 from utils.lr_policy import WarmUpPolyLR
 from utils.logger import get_logger
 from utils.init_func import group_weight
@@ -28,6 +28,7 @@ from utils.print_indicators import Print_Indicators
 from model.MYFusion import MYFusion
 from model.MMoEFusion import MMoEFusion
 from encoder.degradetion import DegradationModel
+from net.llava import FullModel
 import torch.onnx
 
 import kornia
@@ -72,7 +73,6 @@ with Engine(custom_parser=parser) as engine:
         generate_tb_dir = config.tb_dir + '/tb'
         tb = SummaryWriter(log_dir=tb_dir)
         logger.info(f'TensorBoard logging to {tb_dir}')
-        # engine.link_tb(tb_dir, generate_tb_dir)
 
 
     ssim_fusion = SSIMLoss(window_size=11, size_average=True)
@@ -95,11 +95,13 @@ with Engine(custom_parser=parser) as engine:
     # model = MYFusion()
     model = MMoEFusion(
         device=device, 
+        config=config,
         num_classes=config.num_classes, 
         embed_dim=config.decoder_embed_dim, 
         seg_norm=BatchNorm2d,
         align_corners=config.align_corners,
     )
+    # llava_model = FullModel(device=torch.device("cuda:1"))
     degradation = DegradationModel()
     model_name = 'MMoEFusion'
     
@@ -160,6 +162,39 @@ with Engine(custom_parser=parser) as engine:
 
     best_mean_metric = 0.0
     best_epoch = 100000
+    queries = [
+            [
+            {"type": "text", "text": "Can you describe the main scene depicted in the image?"},
+            {"type": "image"},
+        ],
+            [
+            {"type": "text", "text": "What are the key objects present in the image?"},
+            {"type": "image"},
+        ],
+            [
+            {"type": "text", "text": "Which regions in this image are visually significant or contain important details?"}, 
+            {"type": "image"},
+        ],
+            [
+            {"type": "text", "text": "Finally, can you summarize the image in a single descriptive sentence?"},
+            {"type": "image"},
+        ],
+    ]
+    XT = {
+        'vi': {
+            'image': torch.randn(1, 768), 
+            'text': torch.randn(4, 768)
+        },
+        'ir': {
+            'image': torch.randn(1, 768),
+            'text': torch.randn(4, 768)
+        },
+        'fused': {
+            'image': torch.randn(1, 768),
+            'text': torch.randn(4, 768)
+        },
+    }
+
 
     for epoch in range(engine.state.epoch, config.nepochs + 1):
         if engine.distributed:
@@ -206,11 +241,24 @@ with Engine(custom_parser=parser) as engine:
             guide = guide.cuda(non_blocking=True)
             label = label.cuda(non_blocking=True)
 
+            # XT['vi']['image'] = des_rgb[0:1, :]
+            # XT['vi']['text'] = des_rgb[1:, :]
+            # XT['ir']['image'] = des_x[0:1, :]
+            # XT['ir']['text'] = des_x[1:, :]
+
             # rgb = degradation(imgs)
             # ir = degradation(modal_xs, infrared=True)
             rgb = imgs
             ir = modal_xs
             fused, seg_out, loss_aux = model(rgb, ir, des_rgb, des_x) #, loss_load, deg_rgb, deg_ir
+            # reg_fused = (fused - torch.min(fused)) / (torch.max(fused) - torch.min(fused))
+            # _, des_fused = llava_model(reg_fused.to(torch.device("cuda:1")), queries)
+            
+            # des_fused = des_fused.to(torch.device("cuda:0"))
+            # XT['fused']['image'] = des_rgb[0:1, :]
+            # XT['fused']['text'] = des_rgb[1:, :]
+
+            # loss_language = language_driven_fusion_loss(XT, config.lambda_reg)
             # print(seg_out.shape)
             # print(torch.min(seg_out), torch.max(seg_out))
             # loss_fusion, loss_in, loss_grad = criterion_fusion(imgs, modal_xs, fused)
@@ -223,7 +271,7 @@ with Engine(custom_parser=parser) as engine:
             # 试一下将引导系数改为1， 分割改为20
             # loss = loss_fusion +  2 * loss_guide + 10 * loss_seg #+ 0.1*loss_deg#+ 2*(2 - Loss_ssim(imgs, fused) - Loss_ssim(modal_xs, fused)) #+ loss_load                             # + 0.2 * ssim_fusion(imgs, modal_xs, fused)
             #loss = loss_fusion +  2 * loss_guide + 15 * loss_seg #+ 0.1*loss_deg#+ 2*(2 - Loss_ssim(imgs, fused) - Loss_ssim(modal_xs, fused)) #+ loss_load                             # + 0.2 * ssim_fusion(imgs, modal_xs, fused)
-            loss = config.theta * loss_seg + loss_fusion + config.sigma * loss_aux
+            loss = config.theta * loss_seg + loss_fusion + config.sigma * loss_aux # + config.lambda_coeff * loss_language
             # recontruction 
             # imgs_rec, modal_xs_rec = model(imgs, modal_xs)
             # loss = MSELoss(imgs_rec, imgs) + MSELoss(modal_xs_rec, modal_xs) + L1Loss(imgs_rec, imgs) + L1Loss(modal_xs_rec, modal_xs)
@@ -288,6 +336,9 @@ with Engine(custom_parser=parser) as engine:
             tb.add_scalar('train/fusion_loss', sum_loss_fus / len(pbar), epoch)
             tb.add_scalar('train/segment_loss', sum_loss_seg / len(pbar), epoch)
             tb.add_scalar('train/aux_loss', sum_loss_aux / len(pbar), epoch)
+            # for name, param in model.named_parameters():
+            #     if param.grad is not None:
+            #         tb.add_histogram(f"Gradients/{name}", param.grad, global_step=epoch)
             tb.flush()
             
         if (epoch >= config.checkpoint_start_epoch) and (epoch % config.checkpoint_step == 0) or (epoch == config.nepochs):

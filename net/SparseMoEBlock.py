@@ -5,7 +5,7 @@ from torch.distributions.normal import Normal
 import numpy as np
 
 
-class SparseDispatcher(object):
+class SparseDispatcher(nn.Module):
     """Helper for implementing a mixture of experts.
     The purpose of this class is to create input minibatches for the
     experts and to combine the results of the experts to form a unified
@@ -37,23 +37,19 @@ class SparseDispatcher(object):
 
     """
 
-    def __init__(self, num_experts, gates):
+    def __init__(self, gate_size, out_dim, device, num_experts, experts, multiply_by_gates=True):
+        super().__init__()
         """Create a SparseDispatcher."""
-
-        self._gates = gates
         self._num_experts = num_experts
-        # sort experts
-        sorted_experts, index_sorted_experts = torch.nonzero(gates).sort(0)
-        # drop indices
-        _, self._expert_index = sorted_experts.split(1, dim=1)
-        # get according batch index for each expert
-        self._batch_index = torch.nonzero(gates)[index_sorted_experts[:, 1], 0]
-        # calculate num samples that each expert gets
-        self._part_sizes = (gates > 0).sum(0).tolist()
-        # expand gates to match with self._batch_index
-        gates_exp = gates[self._batch_index.flatten()]
-        self._nonzero_gates = torch.gather(gates_exp, 1, self._expert_index)
-
+        self.experts = experts
+        self.multiply_by_gates = multiply_by_gates
+        self.zeros = torch.zeros(
+            int(gate_size),
+            int(out_dim),
+            requires_grad=True,
+            device=device,
+        )
+    '''
     def dispatch(self, inp, extra=None):
         inp_exp = inp[self._batch_index].squeeze(1)
         return torch.split(inp_exp, self._part_sizes, dim=0)
@@ -97,6 +93,48 @@ class SparseDispatcher(object):
         """
         # split nonzero gates for each expert
         return torch.split(self._nonzero_gates, self._part_sizes, dim=0)
+    '''
+    def forward(self, gates, inp):
+        # sort experts
+        sorted_experts, index_sorted_experts = torch.nonzero(gates).sort(0)
+        # drop indices
+        _, _expert_index = sorted_experts.split(1, dim=1)
+        # get according batch index for each expert
+        _batch_index = torch.nonzero(gates)[index_sorted_experts[:, 1], 0]
+        # calculate num samples that each expert gets
+        _part_sizes = (gates > 0).sum(0).tolist()
+        # expand gates to match with self._batch_index
+        gates_exp = gates[_batch_index.flatten()]
+        _nonzero_gates = torch.gather(gates_exp, 1, _expert_index)
+
+        inp_exp = inp[_batch_index].squeeze(1)
+        expert_inputs = torch.split(inp_exp, _part_sizes, dim=0)
+        # split nonzero gates for each expert
+        gates_outs = torch.split(_nonzero_gates, _part_sizes, dim=0)
+        
+        expert_out = [
+            self.experts[i](expert_inputs[i]) for i in range(self._num_experts)
+        ]
+
+        stitched = torch.cat(expert_out, 0).exp()
+
+        if self.multiply_by_gates:
+            stitched = stitched.mul(_nonzero_gates)
+        self.zeros.to(stitched.device)
+        # print(gates.size(0), expert_out[-1].size(1))
+        # zeros = torch.zeros(
+        #     gates.size(0),
+        #     expert_out[-1].size(1),
+        #     # requires_grad=True,
+        #     device=stitched.device,
+        # )
+        # combine samples that have been processed by the same k experts
+        combined = self.zeros.index_add(0, _batch_index, stitched.float())
+        # add eps to all zero values in order to avoid nans when going back to log space
+        combined[combined == 0] = np.finfo(float).eps
+        # back to log space
+        return combined.log()
+
 
 
 class Mlp(nn.Module):
@@ -126,6 +164,8 @@ class MoE(nn.Module):
 
     def __init__(
         self,
+        gate_size,
+        device,
         input_size,
         output_size,
         mlp_ratio,
@@ -153,6 +193,9 @@ class MoE(nn.Module):
 
         self.softplus = nn.Softplus()
         self.softmax = nn.Softmax(1)
+        self.beta  = nn.Parameter(torch.zeros((1, input_size, 1, 1)), requires_grad=True)
+        self.gamma = nn.Parameter(torch.zeros((1, input_size, 1, 1)), requires_grad=True)
+        self.dispatcher = SparseDispatcher(gate_size, output_size, device, self.num_experts, self.experts)
         self.register_buffer("mean", torch.tensor([0.0]))
         self.register_buffer("std", torch.tensor([1.0]))
         assert self.k <= self.num_experts
@@ -279,15 +322,16 @@ class MoE(nn.Module):
             training loss of the model.  The backpropagation of this loss
             encourages all experts to be approximately equally used across a batch.
         """
-
         # import pdb
         # pdb.set_trace()
+        x = x * self.gamma + self.beta
 
         B, C, H, W = x.shape
         prompt = prompt.unsqueeze(-1).unsqueeze(-1).expand_as(x)
 
         x = rearrange(x, "b c h w -> (b h w) c")
         prompt = rearrange(prompt, "b c h w -> (b h w) c")
+        # print(x.shape, prompt.shape)
 
         # prompt and image content work together to improve expert understanding
         x_gating = torch.cat((x, prompt), dim=1)  # [B, 2C, H, W]
@@ -298,32 +342,41 @@ class MoE(nn.Module):
         # one for the index and one for the weight value
         loss = self.cv_squared(importance) + self.cv_squared(load)
 
-        dispatcher = SparseDispatcher(self.num_experts, gates)
-        expert_inputs = dispatcher.dispatch(x)
-        gates = dispatcher.expert_to_gates()
-        expert_outputs = [
-            self.experts[i](expert_inputs[i]) for i in range(self.num_experts)
-        ]
-        y = dispatcher.combine(expert_outputs)
+        # dispatcher = SparseDispatcher(self.num_experts, gates)
+        # expert_inputs = dispatcher.dispatch(x)
+        # gates = dispatcher.expert_to_gates()
+        # expert_outputs = [
+        #     self.experts[i](expert_inputs[i]) for i in range(self.num_experts)
+        # ]
+        # y = dispatcher.combine(expert_outputs)
+        y = self.dispatcher(gates, x)
+        print(y.shape)
+        print(B)
+        print(H)
+        print(W)
         y = rearrange(y, "(b h w) c -> b c h w", b=B, h=H, w=W)
-
+        
         return y, loss
 
 
 class SparseMoEBlock(nn.Module):
-    def __init__(self, atom_dim, dim, ffn_expansion_factor):
+    def __init__(self, gate_size, device, atom_dim, dim, ffn_expansion_factor):
         super(SparseMoEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
         self.fc = nn.Linear(atom_dim, dim)
         self.moe = MoE(
+            gate_size=gate_size,
+            device=device,
             input_size=dim,
             output_size=dim,
             mlp_ratio=ffn_expansion_factor,
-            num_experts=6,
+            num_experts=4,
             noisy_gating=True,
             use_experts=2,
         )
 
     def forward(self, x, prompt):
+        prompt = self.avg_pool(prompt.permute(0, 2, 1)).squeeze(-1)
         d = self.fc(prompt)
         out, loss = self.moe(x, d)
         return out + x, loss
@@ -355,3 +408,15 @@ class Spatial_Routing(nn.Module):
         d = self.fc(prompt) 
         out, loss = self.moe(x, d) 
         return out + x, loss
+
+
+if __name__ == "__main__":
+    x = torch.randn(1, 96, 120, 160)
+    prompt = torch.randn(1, 256, 768)
+    # prompt = prompt.view(1, -1)
+    # b, c = prompt.shape
+    # print(c)
+
+    model = SparseMoEBlock(atom_dim=768, dim=96, ffn_expansion_factor=2)
+    out, loss = model(x, prompt)
+    print(out.shape)

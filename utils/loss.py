@@ -4,6 +4,89 @@ import torch.nn.functional as F
 import kornia
 from torchvision.models import vgg16
 import torchvision
+from utils.logger import get_logger
+
+logger = get_logger()
+
+class ProbOhemCrossEntropy2d(nn.Module):
+    def __init__(self, ignore_label, reduction='mean', thresh=0.6, min_kept=256, down_ratio=1, use_weight=False):
+        super(ProbOhemCrossEntropy2d, self).__init__()
+        self.ignore_label = ignore_label
+        self.thresh = float(thresh)
+        self.min_kept = int(min_kept)
+        self.down_ratio = down_ratio
+        if use_weight:
+            weight = torch.FloatTensor(
+                [0.8373, 0.918, 0.866, 1.0345, 1.0166, 0.9969, 0.9754, 1.0489,
+                 0.8786, 1.0023, 0.9539, 0.9843, 1.1116, 0.9037, 1.0865, 1.0955,
+                 1.0865, 1.1529, 1.0507])
+            self.criterion = torch.nn.CrossEntropyLoss(reduction=reduction, weight=weight, ignore_index=ignore_label)
+        else:
+            self.criterion = torch.nn.CrossEntropyLoss(reduction=reduction, ignore_index=ignore_label)
+
+    def forward(self, pred, target):
+        b, c, h, w = pred.size()
+        target = target.view(-1)
+        valid_mask = target.ne(self.ignore_label)
+        target = target * valid_mask.long()
+        num_valid = valid_mask.sum()
+
+        prob = F.softmax(pred, dim=1)
+        prob = (prob.transpose(0, 1)).reshape(c, -1)
+
+        if self.min_kept > num_valid:
+            logger.info('Labels: {}'.format(num_valid))
+        elif num_valid > 0:
+            prob = prob.masked_fill_(1 - valid_mask, 1)
+            mask_prob = prob[
+                target, torch.arange(len(target), dtype=torch.long)]
+            threshold = self.thresh
+            if self.min_kept > 0:
+                index = mask_prob.argsort()
+                threshold_index = index[min(len(index), self.min_kept) - 1]
+                if mask_prob[threshold_index] > self.thresh:
+                    threshold = mask_prob[threshold_index]
+                kept_mask = mask_prob.le(threshold)     # 概率小于阈值的挖出来
+                target = target * kept_mask.long()
+                valid_mask = valid_mask * kept_mask
+                # logger.info('Valid Mask: {}'.format(valid_mask.sum()))
+
+        target = target.masked_fill_(1 - valid_mask, self.ignore_label)
+        target = target.view(b, h, w)
+
+        return self.criterion(pred, target)
+
+
+# Direction Loss L_d
+def direction_loss(XT):  # {'vi': {'image': 'x', 'text': 'y'}, 'ir': {'image': 'z', 'text': 'w'}, 'fused': {'image': 'a', 'text': 'b'}}
+    delta_V_vi = XT['fused']['image'] - XT['vi']['image']
+    delta_V_ir = XT['fused']['image'] - XT['ir']['image']
+    delta_T_vi = XT['fused']['text'] - XT['vi']['text']
+    delta_T_ir = XT['fused']['text'] - XT['ir']['text']
+    term1 = F.cosine_similarity(delta_V_vi, delta_T_vi, dim=-1)
+    term2 = F.cosine_similarity(delta_V_ir, delta_T_ir, dim=-1)
+    L_d = 1 - 0.5 * (term1 + term2).mean()
+    return L_d
+
+
+# Regularization term Φ
+def regularization_term(XT):
+    V_f = XT['fused']['image']
+    V_vi = XT['vi']['image']
+    V_ir = XT['ir']['image']
+    term1 = 1 - F.cosine_similarity(V_f, V_vi, dim=-1).mean()
+    term2 = 1 - F.cosine_similarity(V_f, V_ir, dim=-1).mean()
+    Phi = term1 + term2
+    return Phi
+
+
+# Language-driven fusion loss L_g
+def language_driven_fusion_loss(XT, lambda_reg=0.5):
+    L_d = direction_loss(XT)
+    Phi = regularization_term(XT)
+    L_g = L_d + lambda_reg * Phi  
+    return L_g
+
 
 class Fusionloss(nn.Module):
     def __init__(self):
@@ -13,6 +96,8 @@ class Fusionloss(nn.Module):
         self.ssim_loss = SSIMLoss(window_size=11, size_average=True)
 
     def forward(self, image_vis, image_ir, generate_img, config):
+        # image_vis = torchvision.transforms.functional.adjust_gamma(image_vis, 0.5, 1)
+        # image_ir = torchvision.transforms.functional.adjust_contrast(image_ir, 1.7)
         # image_y = image_vis[:, :1, :, :]
         image_y = image_vis
         x_in_max = torch.max(image_y, image_ir)
@@ -102,6 +187,7 @@ def Sobelxy(x):
     sobely=F.conv2d(x, weighty, padding=1)
     return sobelx, sobely
 
+
 class MakeFusionLoss(nn.Module):
     def __init__(self):
         super(MakeFusionLoss, self).__init__()
@@ -114,16 +200,16 @@ class MakeFusionLoss(nn.Module):
         Cr_Fuse = YCbCr_Fuse[:,1:2,:,:]
         Cb_Fuse = YCbCr_Fuse[:,2:,:,:]  
         
-        # R_vis = torchvision.transforms.functional.adjust_gamma(input_vis, 0.5, 1)
-        R_vis = input_vis
+        R_vis = torchvision.transforms.functional.adjust_gamma(input_vis, 0.5, 1)
+        # R_vis = input_vis
         YCbCr_R_vis = RGB2YCrCb(R_vis) 
         Y_R_vis = YCbCr_R_vis[:,0:1,:,:]
         Cr_R_vis = YCbCr_R_vis[:,1:2,:,:]
         Cb_R_vis = YCbCr_R_vis[:,2:,:,:]
 
         Y_R_ir = input_ir[:, 0:1, :, :]
-        # R_ir = torchvision.transforms.functional.adjust_contrast(input_ir, 1.7)
-        R_ir = input_ir
+        R_ir = torchvision.transforms.functional.adjust_contrast(input_ir, 1.7)
+        # R_ir = input_ir
 
         Fuse_R = torch.unsqueeze(Fuse[:,0,:,:],1)
         Fuse_G = torch.unsqueeze(Fuse[:,1,:,:],1)
@@ -165,6 +251,7 @@ class MakeFusionLoss(nn.Module):
         fusion_loss_total = 0.5 * con_loss  + 0.2 * gradient_loss  + 1 * color_loss + 0.1 * ssim_loss
 
         return fusion_loss_total
+
 
 class DegradationLoss(nn.Module):
     def __init__(self):
@@ -258,6 +345,7 @@ class SSIMLoss(nn.Module):
         ssim_ir_fused = self.ssim(img_ir, single_img_fused, window_ir, self.window_size, 1, self.size_average)
         return 1 - (ssim_rgb_fused + ssim_ir_fused) / 2
 
+
 class PerceptualLoss(nn.Module):
     def __init__(self):
         super(PerceptualLoss, self).__init__()
@@ -303,6 +391,7 @@ def contrastive_loss(fused_image, image1, image2, temperature=0.5):
 
     loss = -torch.log(F.softmax(torch.stack([pos_sim, neg_sim]) / temperature, dim=0))
     return loss.mean()
+
 
 class RGBLoss(nn.Module):
     def __init__(self):

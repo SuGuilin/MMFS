@@ -214,6 +214,7 @@ class CAB(nn.Module):
         x = self.cab(x)
         return x
 
+
 class TokenSwapMamba(nn.Module):
     def __init__(self, dim, init_ratio=0.5):
         super(TokenSwapMamba, self).__init__()
@@ -240,6 +241,7 @@ class TokenSwapMamba(nn.Module):
         x2 = self.encoder_x2(x2) + x2_short
         x = [x1, x2]
         return x
+
 
 class CIM(nn.Module):
     def __init__(self, dim, compress_ratio=3, squeeze_factor=16, kernel_size=1, reduction=4):

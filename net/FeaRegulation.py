@@ -126,13 +126,20 @@ class CrossFeatureRegulationModule(nn.Module):
 
 
 if __name__ == "__main__":
+    import cv2
     batch_size = 4
     height = 32
     width = 32
     channels = 64
 
-    F_rgb = torch.randn(batch_size, channels, height, width)  # RGB features
-    F_ther = torch.randn(batch_size, channels, height, width)  # Thermal features
+    rgb = cv2.imread('/home/suguilin/MMFS/datasets/MFNet/RGB/00093D.png', 0) / 255.
+    ther = cv2.imread('/home/suguilin/MMFS/datasets/MFNet/Modal/00093D.png', 0) / 255.
+
+    F_rgb = rgb.unsqueeze(0).permute(0, 3, 1, 2)
+    F_ther = ther.unsqueeze(0).permute(0, 3, 1, 2)
+
+    # F_rgb = torch.randn(batch_size, channels, height, width)  # RGB features
+    # F_ther = torch.randn(batch_size, channels, height, width)  # Thermal features
 
     # Initialize and run the CFRM
     cfrm = CrossFeatureRegulationModule(in_channels=channels)
